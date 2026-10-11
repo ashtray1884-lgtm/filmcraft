@@ -17,6 +17,9 @@ Notes
   click "More info", then "Run anyway".
 - Pictures use the clip's as-shot look. If the camera recorded "Film" gamma they will look flat,
   as in DaVinci Resolve before grading; use Lumetri Color to grade.
+- Frames are decoded on your graphics card (NVIDIA through CUDA, AMD and Intel through OpenCL),
+  as in Premiere Pro. "Check Blackmagic RAW.bat" shows which card it uses ("decoded on: ...").
+  If the card can't be used, FilmCraft decodes on the processor instead, automatically.
 - Playback decodes at a reduced size when the monitor is small, so 6K stays smooth; export
   always decodes at full size.
 - Problems: run "Check Blackmagic RAW.bat" with the clip and send the text it prints.

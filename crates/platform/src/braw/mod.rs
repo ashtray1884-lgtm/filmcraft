@@ -222,6 +222,11 @@ pub trait Runtime: Send + Sync {
     /// For messages ("Blackmagic RAW 4.x").
     fn name(&self) -> String;
     fn open(&self, path: &Path) -> Result<Arc<dyn Clip>, String>;
+    /// Where frames are decoded now ("graphics card: NVIDIA GeForce RTX 4070 (CUDA)", "CPU (…)"),
+    /// for `braw-check`; `None` before the runtime is loaded.
+    fn decoding_on(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Why no runtime is available, for the import error.

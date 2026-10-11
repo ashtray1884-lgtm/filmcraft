@@ -16,10 +16,18 @@
 //!    (`DllGetClassObject`), then `QueryInterface` for the factory interface the type library
 //!    describes, so the object and the slots always come from the same runtime.
 //!
-//! Decoding follows the SDK's documented flow: one codec per clip with our callback object, the
-//! CPU pipeline; read job → frame (resource format RGB 16-bit, resolution scale) → decode and
-//! process job → processed image, each step completed with `FlushJobs`. Calls on a clip are
-//! serialised by a mutex; the SDK runs its own worker threads.
+//! Decoding follows the SDK's documented flow: codecs with our callback object; read job → frame
+//! (resource format RGB 16-bit, resolution scale) → decode and process job → processed image,
+//! each step completed with `FlushJobs`. Each clip has a few decoders (codec + clip), each used by
+//! one thread at a time; the SDK runs its own worker threads.
+//!
+//! **Graphics card.** Like Premiere Pro and DaVinci Resolve, frames are decoded on the graphics
+//! card when the runtime offers it: the runtime's pipeline list (CUDA first, then OpenCL; a
+//! discrete card before integrated graphics), one pipeline device (context and command queue) per
+//! decoder set on the codec's configuration, and the finished picture copied back through the
+//! codec's resource manager into a pinned download buffer reused frame after frame. If the card
+//! cannot be set up, or a frame fails on it that the CPU decodes, FilmCraft decodes on the CPU
+//! from then on. `FILMCRAFT_BRAW_PIPELINE` = `cpu` / `cuda` / `opencl` forces a choice.
 //!
 //! [`check_runtime`] reports all of this in words (the CLI's `braw-check`), which is how a user's machine
 //! tells us what it has.
@@ -37,16 +45,35 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_
 use windows::Win32::System::Ole::{LoadTypeLibEx, REGKIND_NONE};
 use windows::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW};
 use windows::Win32::System::Variant::{
-    VARENUM, VT_BSTR, VT_ERROR, VT_HRESULT, VT_I4, VT_I8, VT_INT, VT_PTR, VT_R4, VT_UI4, VT_UI8, VT_UINT, VT_UNKNOWN, VT_USERDEFINED,
+    VARENUM, VT_BOOL, VT_BSTR, VT_ERROR, VT_HRESULT, VT_I1, VT_I2, VT_I4, VT_I8, VT_INT, VT_PTR, VT_R4, VT_UI1, VT_UI2, VT_UI4, VT_UI8, VT_UINT, VT_UNKNOWN,
+    VT_USERDEFINED,
 };
 use windows::core::{BSTR, GUID, HSTRING, Interface, PCWSTR, s};
 
-use super::{AudioInfo, Changes, Clip, ClipInfo, FORMAT_RGB_U16, Kind, Picture, Runtime, Scale, Setting, fourcc, pcm_to_f32, rate_from_f32, to_picture};
+use super::{
+    AudioInfo, Changes, Clip, ClipInfo, FORMAT_RGB_U16, FORMAT_RGBA_U16, Kind, Picture, Runtime, Scale, Setting, fourcc, pcm_to_f32, rate_from_f32, to_picture,
+};
 use serde_json::{Value, json};
 
 type Raw = *mut c_void;
 
 const PIPELINE_CPU: u32 = fourcc(b"cpub");
+const PIPELINE_CUDA: u32 = fourcc(b"cuda");
+const PIPELINE_OPENCL: u32 = fourcc(b"opcl");
+const INTEROP_NONE: u32 = fourcc(b"none");
+/// `blackmagicRawResourceTypeBufferCPU`: page-aligned CPU memory.
+const RESOURCE_CPU: u32 = fourcc(b"cpub");
+/// `blackmagicRawResourceUsageReadCPUWriteGPU`: the GPU writes it, the CPU reads it (a download buffer).
+const USAGE_READ_CPU_WRITE_GPU: u32 = fourcc(b"rcwg");
+
+fn pipeline_name(p: u32) -> &'static str {
+    match p {
+        PIPELINE_CPU => "CPU",
+        PIPELINE_CUDA => "CUDA",
+        PIPELINE_OPENCL => "OpenCL",
+        _ => "other",
+    }
+}
 
 fn scale_code(s: Scale) -> u32 {
     match s {
@@ -72,6 +99,8 @@ enum Arg {
     W32,
     W64,
     F32,
+    /// An 8- or 16-bit integer (`Boolean`): passed in a full register.
+    Small,
     Other(u16),
 }
 
@@ -115,6 +144,7 @@ fn classify(ti: &ITypeInfo, td: &TYPEDESC, depth: u32) -> Arg {
         VT_I4 | VT_UI4 | VT_INT | VT_UINT | VT_HRESULT | VT_ERROR => Arg::W32,
         VT_I8 | VT_UI8 => Arg::W64,
         VT_R4 => Arg::F32,
+        VT_UI1 | VT_I1 | VT_BOOL | VT_I2 | VT_UI2 => Arg::Small,
         VT_USERDEFINED if depth < 8 => {
             // SAFETY: for VT_USERDEFINED the union holds `hreftype` (TYPEDESC contract).
             let href = unsafe { td.Anonymous.hreftype };
@@ -391,7 +421,7 @@ fn com_init() {
 // ---------------------------------------------------------------------------------------------
 // The interface table: every slot FilmCraft calls, verified
 
-use Arg::{Ptr as P, W32, W64};
+use Arg::{Ptr as P, Small, W32, W64};
 
 #[derive(Debug)]
 struct Api {
@@ -422,6 +452,38 @@ struct Api {
     audio: Option<AudioApi>,
     /// Clip and frame processing attributes (Source Settings), when the runtime describes them.
     proc: Option<ProcApi>,
+    /// Decoding on the graphics card (CUDA / OpenCL), when the runtime describes it.
+    gpu: Option<GpuApi>,
+}
+
+/// The interfaces for decoding on the graphics card: pipelines and their devices, the codec's
+/// configuration, and the resource manager that copies the finished picture to memory.
+#[derive(Debug)]
+struct GpuApi {
+    f_pipelines: usize,
+    f_devices: usize,
+    pi_next: usize,
+    pi_name: usize,
+    pi_pipeline: usize,
+    di_next: usize,
+    di_create: usize,
+    dev_name: usize,
+    dev_pipeline: usize,
+    dev_best_isa: Option<usize>,
+    dev_formats: Option<usize>,
+    cfg_iid: GUID,
+    cfg_from_device: usize,
+    cfgx_iid: GUID,
+    cfgx_manager: usize,
+    c_prepare_device: Option<usize>,
+    rm_create: usize,
+    rm_release: usize,
+    rm_copy: usize,
+    rm_host: usize,
+    img_type: usize,
+    img_context: usize,
+    /// `IBlackmagicRawCallback::PreparePipelineComplete`, to learn whether preparing failed.
+    cb_prepare: Option<usize>,
 }
 
 /// One of the two processing-attribute interfaces (clip or frame): the same five methods.
@@ -491,6 +553,7 @@ impl Api {
             cb_process: cb.slot("IBlackmagicRawCallback", "ProcessComplete", &[P, W32, P], false)?,
             audio: None,
             proc: None,
+            gpu: None,
         };
         if api.cb_slots <= api.cb_read.max(api.cb_process) || api.cb_slots > 256 {
             return Err(format!("IBlackmagicRawCallback has an unexpected size ({} slots)", api.cb_slots));
@@ -531,6 +594,44 @@ impl Api {
                 frame: attr(fa, "IBlackmagicRawFrameProcessingAttributes", "Frame")?,
             })
         })();
+        let gpu = (|| -> Result<GpuApi, String> {
+            let (pi, di, dev) = (get("IBlackmagicRawPipelineIterator")?, get("IBlackmagicRawPipelineDeviceIterator")?, get("IBlackmagicRawPipelineDevice")?);
+            let (cfg, cfgx, rm) = (get("IBlackmagicRawConfiguration")?, get("IBlackmagicRawConfigurationEx")?, get("IBlackmagicRawResourceManager")?);
+            let (npi, ndi, ndev, nrm) =
+                ("IBlackmagicRawPipelineIterator", "IBlackmagicRawPipelineDeviceIterator", "IBlackmagicRawPipelineDevice", "IBlackmagicRawResourceManager");
+            Ok(GpuApi {
+                f_pipelines: f.slot("IBlackmagicRawFactory", "CreatePipelineIterator", &[W32, P], true)?,
+                f_devices: f.slot("IBlackmagicRawFactory", "CreatePipelineDeviceIterator", &[W32, W32, P], true)?,
+                pi_next: pi.slot(npi, "Next", &[], true)?,
+                pi_name: pi.slot(npi, "GetName", &[P], true)?,
+                pi_pipeline: pi.slot(npi, "GetPipeline", &[P], true)?,
+                di_next: di.slot(ndi, "Next", &[], true)?,
+                di_create: di.slot(ndi, "CreateDevice", &[P], true)?,
+                dev_name: dev.slot(ndev, "GetName", &[P], true)?,
+                dev_pipeline: dev.slot(ndev, "GetPipeline", &[P, P, P], true)?,
+                dev_best_isa: dev.slot(ndev, "SetBestInstructionSet", &[], true).ok(),
+                dev_formats: dev.slot(ndev, "GetSupportedResourceFormats", &[P, P], true).ok(),
+                cfg_iid: cfg.iid,
+                cfg_from_device: cfg.slot("IBlackmagicRawConfiguration", "SetFromDevice", &[P], true)?,
+                cfgx_iid: cfgx.iid,
+                cfgx_manager: cfgx.slot("IBlackmagicRawConfigurationEx", "GetResourceManager", &[P], true)?,
+                c_prepare_device: c.slot("IBlackmagicRaw", "PreparePipelineForDevice", &[P, P], true).ok(),
+                rm_create: rm.slot(nrm, "CreateResource", &[P, P, W32, W32, W32, P], true)?,
+                rm_release: rm.slot(nrm, "ReleaseResource", &[P, P, P, W32], true)?,
+                rm_copy: rm.slot(nrm, "CopyResource", &[P, P, P, W32, P, W32, W32, Small], true)?,
+                rm_host: rm.slot(nrm, "GetResourceHostPointer", &[P, P, P, W32, P], true)?,
+                img_type: im.slot("IBlackmagicRawProcessedImage", "GetResourceType", &[P], true)?,
+                img_context: im.slot("IBlackmagicRawProcessedImage", "GetResourceContextAndCommandQueue", &[P, P], true)?,
+                cb_prepare: cb.slot("IBlackmagicRawCallback", "PreparePipelineComplete", &[P, W32], false).ok(),
+            })
+        })();
+        let api = match gpu {
+            Ok(g) => Api { gpu: Some(g), ..api },
+            Err(e) => {
+                notes.push(format!("graphics card decoding off: {e}"));
+                api
+            }
+        };
         let api = match proc {
             Ok(pr) => Api { proc: Some(pr), ..api },
             Err(e) => {
@@ -560,8 +661,105 @@ impl Api {
 struct CbState {
     /// ReadComplete: result and the frame (AddRef'd, released by the taker).
     read: Option<(i32, usize)>,
-    /// ProcessComplete: result and the copied picture (width, height, format, bytes).
-    image: Option<Result<(u32, u32, u32, Vec<u8>), String>>,
+    /// ProcessComplete: the picture, converted straight from the runtime's buffer.
+    image: Option<Result<Picture, String>>,
+    /// PreparePipelineComplete: its result.
+    prepared: Option<i32>,
+}
+
+/// A download buffer in memory the CPU reads: made by the runtime's resource manager (pinned
+/// memory the graphics card copies into directly), or page-aligned memory of our own.
+struct HostBuf {
+    res: usize,
+    ptr: usize,
+    size: u32,
+    ctx: usize,
+    queue: usize,
+    /// Our own allocation (freed by us), rather than the resource manager's.
+    own: Option<std::alloc::Layout>,
+}
+
+/// Copies a picture the graphics card finished into memory FilmCraft can read, through the
+/// codec's resource manager, reusing one download buffer frame after frame.
+struct GpuCopy {
+    rm: Com,
+    create: usize,
+    release: usize,
+    copy: usize,
+    host: usize,
+    img_type: usize,
+    img_context: usize,
+    buf: Mutex<Option<HostBuf>>,
+}
+
+impl GpuCopy {
+    /// Run `f` on the bytes of `image` (whose resource is `src`, `size` bytes). `None` when the
+    /// picture is already in CPU memory (nothing to copy).
+    fn with_bytes<R>(&self, image: Raw, src: Raw, size: u32, f: impl FnOnce(&[u8]) -> R) -> Option<Result<R, String>> {
+        let mut ty = 0u32;
+        if vcall!(image, self.img_type, fn(*mut u32) -> i32, &mut ty) < 0 || ty == RESOURCE_CPU {
+            return None;
+        }
+        Some(self.download(image, src, ty, size).map(f))
+    }
+
+    /// Copy the GPU resource into the download buffer; the slice stays valid until the buffer is
+    /// replaced or released, which only this decoder's own (serialised) calls do.
+    fn download(&self, image: Raw, src: Raw, ty: u32, size: u32) -> Result<&[u8], String> {
+        let (mut ctx, mut queue) = (std::ptr::null_mut::<c_void>(), std::ptr::null_mut::<c_void>());
+        check(vcall!(image, self.img_context, fn(*mut Raw, *mut Raw) -> i32, &mut ctx, &mut queue), "GetResourceContextAndCommandQueue")?;
+        let mut guard = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
+        let fits = guard.as_ref().is_some_and(|b| b.size >= size && b.ctx == ctx as usize && b.queue == queue as usize);
+        if !fits {
+            if let Some(old) = guard.take() {
+                self.free(old);
+            }
+            *guard = Some(self.alloc(ctx, queue, size)?);
+        }
+        let b = guard.as_ref().ok_or("no download buffer")?;
+        let copied = vcall!(self.rm.0, self.copy, fn(Raw, Raw, Raw, u32, Raw, u32, u32, u32) -> i32, ctx, queue, src, ty, b.res as Raw, RESOURCE_CPU, size, 0);
+        check(copied, "CopyResource (graphics card → memory)")?;
+        // SAFETY: the buffer holds at least `size` bytes (checked above) and was just written by a
+        // synchronous copy; it lives until `free`, which needs this decoder's lock that our caller holds.
+        Ok(unsafe { std::slice::from_raw_parts(b.ptr as *const u8, size as usize) })
+    }
+
+    fn alloc(&self, ctx: Raw, queue: Raw, size: u32) -> Result<HostBuf, String> {
+        let mut res: Raw = std::ptr::null_mut();
+        let hr =
+            vcall!(self.rm.0, self.create, fn(Raw, Raw, u32, u32, u32, *mut Raw) -> i32, ctx, queue, size, RESOURCE_CPU, USAGE_READ_CPU_WRITE_GPU, &mut res);
+        if hr >= 0 && !res.is_null() {
+            let mut host: Raw = std::ptr::null_mut();
+            let got = vcall!(self.rm.0, self.host, fn(Raw, Raw, Raw, u32, *mut Raw) -> i32, ctx, queue, res, RESOURCE_CPU, &mut host);
+            // a CPU resource is its own address when the runtime does not say otherwise
+            let ptr = if got >= 0 && !host.is_null() { host } else { res };
+            return Ok(HostBuf { res: res as usize, ptr: ptr as usize, size, ctx: ctx as usize, queue: queue as usize, own: None });
+        }
+        let layout = std::alloc::Layout::from_size_align(size.max(1) as usize, 4096).map_err(|e| e.to_string())?;
+        // SAFETY: a non-zero size with a valid alignment; freed in `free` with the same layout.
+        let p = unsafe { std::alloc::alloc(layout) };
+        if p.is_null() {
+            return Err(format!("could not allocate {size} bytes for the picture"));
+        }
+        Ok(HostBuf { res: p as usize, ptr: p as usize, size, ctx: ctx as usize, queue: queue as usize, own: Some(layout) })
+    }
+
+    fn free(&self, b: HostBuf) {
+        match b.own {
+            // SAFETY: allocated in `alloc` with this layout, freed once (the buffer is moved in).
+            Some(layout) => unsafe { std::alloc::dealloc(b.ptr as *mut u8, layout) },
+            None => {
+                let _ = vcall!(self.rm.0, self.release, fn(Raw, Raw, Raw, u32) -> i32, b.ctx as Raw, b.queue as Raw, b.res as Raw, RESOURCE_CPU);
+            }
+        }
+    }
+
+    /// Release the download buffer (before the codec and its device go).
+    fn release_buffer(&self) {
+        if let Some(b) = self.buf.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            self.free(b);
+        }
+    }
 }
 
 #[repr(C)]
@@ -575,6 +773,8 @@ struct Callback {
     /// methods this table lacks) is told no rather than calling past its end.
     iid: GUID,
     state: Mutex<CbState>,
+    /// Set when the codec decodes on the graphics card (before the callback is registered).
+    gpu: OnceLock<GpuCopy>,
 }
 
 unsafe extern "system" fn cb_query(this: Raw, iid: *const GUID, out: *mut Raw) -> i32 {
@@ -622,13 +822,24 @@ unsafe extern "system" fn cb_process(this: Raw, _job: Raw, hr: i32, image: Raw) 
         if !ok || res.is_null() || size == 0 || size > 1 << 31 {
             Err("the runtime returned no picture".into())
         } else {
-            // SAFETY: GetResource returned a CPU buffer of GetResourceSizeBytes bytes, valid
-            // while the processed image is (for the duration of this callback).
-            let bytes = unsafe { std::slice::from_raw_parts(res as *const u8, size as usize) }.to_vec();
-            Ok((w, h, fmt, bytes))
+            match me.gpu.get().and_then(|g| g.with_bytes(image, res, size, |b| to_picture(w, h, fmt, b))) {
+                Some(r) => r.and_then(|p| p),
+                None => {
+                    // SAFETY: GetResource returned a CPU buffer of GetResourceSizeBytes bytes, valid
+                    // while the processed image is (for the duration of this callback).
+                    let bytes = unsafe { std::slice::from_raw_parts(res as *const u8, size as usize) };
+                    to_picture(w, h, fmt, bytes)
+                }
+            }
         }
     };
     me.state.lock().unwrap_or_else(PoisonError::into_inner).image = Some(result);
+}
+
+unsafe extern "system" fn cb_prepared(this: Raw, _user: Raw, hr: i32) {
+    // SAFETY: as in cb_read.
+    let me = unsafe { &*(this as *const Callback) };
+    me.state.lock().unwrap_or_else(PoisonError::into_inner).prepared = Some(hr);
 }
 
 impl Callback {
@@ -644,12 +855,16 @@ impl Callback {
         set(&mut table, 2, cb_addref as *const c_void);
         set(&mut table, api.cb_read, cb_read as *const c_void);
         set(&mut table, api.cb_process, cb_process as *const c_void);
+        if let Some(i) = api.gpu.as_ref().and_then(|g| g.cb_prepare) {
+            set(&mut table, i, cb_prepared as *const c_void);
+        }
         let mut cb = Box::new(Callback {
             vtbl: std::ptr::null(),
             table,
             img: [api.img_width, api.img_height, api.img_resource, api.img_size, api.img_format],
             iid: api.cb_iid,
             state: Mutex::default(),
+            gpu: OnceLock::new(),
         });
         cb.vtbl = cb.table.as_ptr();
         cb
@@ -672,6 +887,160 @@ struct Loaded {
     factory: Com,
     dll: PathBuf,
     notes: Vec<String>,
+    /// The graphics card FilmCraft decodes on (`None`: the CPU).
+    gpu: Option<GpuChoice>,
+    /// Decoding on the graphics card failed where the CPU worked: the CPU from now on.
+    gpu_off: std::sync::atomic::AtomicBool,
+    gpu_why: Mutex<Option<String>>,
+}
+
+/// A graphics card pipeline and device.
+#[derive(Clone, Debug)]
+struct GpuChoice {
+    pipeline: u32,
+    /// Position in the runtime's device list for this pipeline.
+    index: usize,
+    device: String,
+}
+
+impl GpuChoice {
+    fn label(&self) -> String {
+        format!("{} ({})", self.device, pipeline_name(self.pipeline))
+    }
+}
+
+impl Loaded {
+    fn gpu_active(&self) -> Option<&GpuChoice> {
+        self.gpu.as_ref().filter(|_| !self.gpu_off.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    fn disable_gpu(&self, why: String) {
+        log::warn!("Blackmagic RAW: decoding on the CPU from now on: {why}");
+        self.gpu_off.store(true, std::sync::atomic::Ordering::Relaxed);
+        *self.gpu_why.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+    }
+    /// Where frames are decoded, in words.
+    fn pipeline_text(&self) -> String {
+        match (self.gpu_active(), &self.gpu) {
+            (Some(g), _) => format!("graphics card: {}", g.label()),
+            (None, Some(_)) => {
+                format!("CPU (graphics card turned off: {})", self.gpu_why.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or_default())
+            }
+            (None, None) => {
+                let why = self.notes.iter().find(|n| n.starts_with("graphics card")).cloned().unwrap_or_else(|| "no graphics card pipeline".into());
+                format!("CPU ({why})")
+            }
+        }
+    }
+}
+
+fn bstr_out(obj: Raw, slot: usize) -> String {
+    let mut b = BSTR::new();
+    if vcall!(obj, slot, fn(*mut BSTR) -> i32, &mut b) >= 0 { bstr_string(&b) } else { String::new() }
+}
+
+/// Graphics cards before integrated graphics (OpenCL lists both on many laptops).
+fn device_rank(name: &str) -> u32 {
+    let n = name.to_ascii_lowercase();
+    if ["nvidia", "geforce", "rtx", "quadro", "radeon", "amd", " arc"].iter().any(|k| n.contains(k)) {
+        2
+    } else if n.contains("intel") {
+        0
+    } else {
+        1
+    }
+}
+
+/// The devices of `pipeline`: (device, name), in the runtime's order (at most eight).
+fn devices(g: &GpuApi, factory: &Com, pipeline: u32, upto: Option<usize>) -> Result<Vec<(Com, String)>, String> {
+    let mut it: Raw = std::ptr::null_mut();
+    check(vcall!(factory.0, g.f_devices, fn(u32, u32, *mut Raw) -> i32, pipeline, INTEROP_NONE, &mut it), "CreatePipelineDeviceIterator")?;
+    if it.is_null() {
+        return Err("no devices".into());
+    }
+    let it = Com(it);
+    let mut out = Vec::new();
+    for i in 0..8 {
+        let mut dev: Raw = std::ptr::null_mut();
+        let hr = vcall!(it.0, g.di_create, fn(*mut Raw) -> i32, &mut dev);
+        if hr >= 0 && !dev.is_null() {
+            let dev = Com(dev);
+            let name = bstr_out(dev.0, g.dev_name);
+            out.push((dev, if name.trim().is_empty() { format!("device {}", i + 1) } else { name.trim().to_string() }));
+        } else if out.is_empty() && upto.is_none() {
+            return Err(format!("CreateDevice failed ({})", hr_text(hr)));
+        }
+        if upto.is_some_and(|u| i >= u) || vcall!(it.0, g.di_next, fn() -> i32,) != 0 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Device `index` of `pipeline`, created fresh (each decoder has its own context and queue).
+fn open_device(g: &GpuApi, factory: &Com, pipeline: u32, index: usize) -> Result<Com, String> {
+    let list = devices(g, factory, pipeline, Some(index))?;
+    list.into_iter().nth(index).map(|(d, _)| d).ok_or_else(|| format!("device {} is gone", index + 1))
+}
+
+/// Which graphics card to decode on: CUDA, then OpenCL, as the runtime lists them.
+/// `FILMCRAFT_BRAW_PIPELINE` = `cpu`, `cuda` or `opencl` overrides the choice.
+fn choose_gpu(api: &Api, factory: &Com, notes: &mut Vec<String>) -> Option<GpuChoice> {
+    let g = api.gpu.as_ref()?;
+    let want = std::env::var("FILMCRAFT_BRAW_PIPELINE").unwrap_or_default().trim().to_ascii_lowercase();
+    let prefs: &[u32] = match want.as_str() {
+        "cpu" => {
+            notes.push("graphics card decoding off: FILMCRAFT_BRAW_PIPELINE=cpu".into());
+            return None;
+        }
+        "cuda" => &[PIPELINE_CUDA],
+        "opencl" => &[PIPELINE_OPENCL],
+        _ => &[PIPELINE_CUDA, PIPELINE_OPENCL],
+    };
+    let mut it: Raw = std::ptr::null_mut();
+    let hr = vcall!(factory.0, g.f_pipelines, fn(u32, *mut Raw) -> i32, INTEROP_NONE, &mut it);
+    if hr < 0 || it.is_null() {
+        notes.push(format!("graphics card decoding off: the runtime lists no pipelines ({})", hr_text(hr)));
+        return None;
+    }
+    let it = Com(it);
+    let mut listed = Vec::new();
+    for _ in 0..16 {
+        let mut p = 0u32;
+        if vcall!(it.0, g.pi_pipeline, fn(*mut u32) -> i32, &mut p) >= 0 {
+            listed.push((p, bstr_out(it.0, g.pi_name)));
+        }
+        if vcall!(it.0, g.pi_next, fn() -> i32,) != 0 {
+            break;
+        }
+    }
+    notes.push(format!(
+        "pipelines: {}",
+        listed
+            .iter()
+            .map(|(p, n)| if n.is_empty() { pipeline_name(*p).to_string() } else { format!("{n} ({})", pipeline_name(*p)) })
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    for &p in prefs {
+        if !listed.iter().any(|(q, _)| *q == p) {
+            continue;
+        }
+        match devices(g, factory, p, None) {
+            Ok(list) if !list.is_empty() => {
+                notes.push(format!("{} devices: {}", pipeline_name(p), list.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ")));
+                let best = list.iter().enumerate().max_by_key(|(i, (_, n))| (device_rank(n), usize::MAX - i)).map(|(i, (_, n))| (i, n.clone()));
+                if let Some((index, device)) = best {
+                    let c = GpuChoice { pipeline: p, index, device };
+                    notes.push(format!("graphics card: {}", c.label()));
+                    return Some(c);
+                }
+            }
+            Ok(_) => notes.push(format!("{}: no devices", pipeline_name(p))),
+            Err(e) => notes.push(format!("{}: {e}", pipeline_name(p))),
+        }
+    }
+    notes.push("graphics card decoding off: no CUDA or OpenCL device".into());
+    None
 }
 
 fn load() -> Result<Loaded, String> {
@@ -687,7 +1056,10 @@ fn load() -> Result<Loaded, String> {
     let mut errors = Vec::new();
     for dll in &dlls {
         match load_from(dll, &classes, &mut notes) {
-            Ok((api, factory)) => return Ok(Loaded { api, factory, dll: dll.clone(), notes }),
+            Ok((api, factory)) => {
+                let gpu = choose_gpu(&api, &factory, &mut notes);
+                return Ok(Loaded { api, factory, dll: dll.clone(), notes, gpu, gpu_off: Default::default(), gpu_why: Mutex::new(None) });
+            }
             Err(e) => errors.push(format!("{}: {e}", dll.display())),
         }
     }
@@ -785,28 +1157,41 @@ impl Runtime for WinRuntime {
         let rt = self.get()?;
         WinClip::open(rt, path).map(|c| Arc::new(c) as Arc<dyn Clip>)
     }
+    fn decoding_on(&self) -> Option<String> {
+        self.loaded.get().and_then(|l| l.as_ref().ok()).map(|l| l.pipeline_text())
+    }
 }
 
-/// Decoders a clip may have at once, each with its own codec, clip and callback: one decoder
-/// finishes one frame per `FlushJobs`, so playback's workers would otherwise wait on each other.
+/// Decoders a clip may have at once, each with its own codec, clip and callback (and, on the
+/// graphics card, its own device: context and command queue): one decoder finishes one frame per
+/// `FlushJobs`, so playback's workers would otherwise wait on each other, and with two the card
+/// decodes one frame while the previous one is read from disk or copied back.
 /// `FILMCRAFT_BRAW_DECODERS` (1–8) overrides it.
-fn max_decoders() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        let env = std::env::var("FILMCRAFT_BRAW_DECODERS").ok().and_then(|v| v.trim().parse::<usize>().ok());
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        env.unwrap_or(if cores >= 12 { 3 } else { 2 }).clamp(1, 8)
-    })
+fn max_decoders(gpu: bool) -> usize {
+    let env = std::env::var("FILMCRAFT_BRAW_DECODERS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let auto = if gpu {
+        2
+    } else if cores >= 12 {
+        3
+    } else {
+        2
+    };
+    env.unwrap_or(auto).clamp(1, 8)
 }
 
 /// One decoder of a clip.
 struct Inner {
     rt: Arc<Loaded>,
-    // drop order (after Drop below has flushed and detached the callback): clip and audio, then
-    // the codec, then the callback
+    /// The resource format pictures come in (RGB 16-bit, or RGBA 16-bit where a graphics card
+    /// offers only that).
+    format: u32,
+    // drop order (after Drop below has flushed, detached the callback and released the download
+    // buffer): clip and audio, then the codec, then its graphics card device, then the callback
     audio: Option<Com>,
     clip: Com,
     codec: Com,
+    device: Option<Com>,
     cb: Box<Callback>,
 }
 
@@ -816,6 +1201,9 @@ impl Drop for Inner {
         let api = &self.rt.api;
         let _ = vcall!(self.codec.0, api.c_flush, fn() -> i32,);
         let _ = vcall!(self.codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
+        if let Some(g) = self.cb.gpu.get() {
+            g.release_buffer();
+        }
         let mut st = self.cb.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, f)) = st.read.take()
             && f != 0
@@ -825,26 +1213,97 @@ impl Drop for Inner {
     }
 }
 
+/// The resource format to ask a graphics card for: RGB 16-bit when it offers it, else RGBA 16-bit.
+fn gpu_format(g: &GpuApi, device: &Com) -> u32 {
+    let Some(slot) = g.dev_formats else { return FORMAT_RGB_U16 };
+    let mut list = [0u32; 64];
+    let mut n = list.len() as u32;
+    if vcall!(device.0, slot, fn(*mut u32, *mut u32) -> i32, list.as_mut_ptr(), &mut n) < 0 {
+        return FORMAT_RGB_U16;
+    }
+    let got = list.get(..(n as usize).min(list.len())).unwrap_or_default();
+    if got.contains(&FORMAT_RGB_U16) || !got.contains(&FORMAT_RGBA_U16) { FORMAT_RGB_U16 } else { FORMAT_RGBA_U16 }
+}
+
 impl Inner {
+    /// A decoder on the graphics card when there is one (falling back to the CPU for good if the
+    /// card cannot be set up), else on the CPU.
     fn open(rt: &Arc<Loaded>, path: &Path) -> Result<Inner, String> {
+        if let Some(c) = rt.gpu_active().cloned() {
+            match Inner::open_on(rt, path, Some(&c)) {
+                Ok(i) => return Ok(i),
+                Err(e) => rt.disable_gpu(format!("{} could not be set up: {e}", c.label())),
+            }
+        }
+        Inner::open_on(rt, path, None)
+    }
+
+    fn open_on(rt: &Arc<Loaded>, path: &Path, gpu: Option<&GpuChoice>) -> Result<Inner, String> {
         com_init();
         let api = &rt.api;
-        // created before the codec so that, on an early return, the codec is released first
+        // created before the device and the codec so that, on an early return, the codec is
+        // released first, then the device, then the callback
         let cb = Callback::new(api);
+        let device = match (gpu, &api.gpu) {
+            (Some(c), Some(g)) => Some(open_device(g, &rt.factory, c.pipeline, c.index)?),
+            _ => None,
+        };
         let mut codec: Raw = std::ptr::null_mut();
         check(vcall!(rt.factory.0, api.f_create_codec, fn(*mut Raw) -> i32, &mut codec), "CreateCodec")?;
         if codec.is_null() {
             return Err("CreateCodec returned nothing".into());
         }
         let codec = Com(codec);
-        check(vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, cb.as_raw()), "SetCallback")?;
-        let null = std::ptr::null_mut::<c_void>();
-        let prepared = vcall!(codec.0, api.c_prepare_pipeline, fn(u32, Raw, Raw, Raw) -> i32, PIPELINE_CPU, null, null, null);
-        if let Err(e) = check(prepared, "PreparePipeline (CPU)") {
-            let _ = vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
-            return Err(e);
+        let mut format = FORMAT_RGB_U16;
+        if let (Some(dev), Some(g)) = (&device, &api.gpu) {
+            if let Some(i) = g.dev_best_isa {
+                let _ = vcall!(dev.0, i, fn() -> i32,);
+            }
+            let cfg = query(codec.0, &g.cfg_iid)?;
+            check(vcall!(cfg.0, g.cfg_from_device, fn(Raw) -> i32, dev.0), "SetFromDevice")?;
+            let cfgx = query(codec.0, &g.cfgx_iid)?;
+            let mut rm: Raw = std::ptr::null_mut();
+            check(vcall!(cfgx.0, g.cfgx_manager, fn(*mut Raw) -> i32, &mut rm), "GetResourceManager")?;
+            if rm.is_null() {
+                return Err("GetResourceManager returned nothing".into());
+            }
+            format = gpu_format(g, dev);
+            let copy = GpuCopy {
+                rm: Com(rm),
+                create: g.rm_create,
+                release: g.rm_release,
+                copy: g.rm_copy,
+                host: g.rm_host,
+                img_type: g.img_type,
+                img_context: g.img_context,
+                buf: Mutex::new(None),
+            };
+            let _ = cb.gpu.set(copy);
         }
+        check(vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, cb.as_raw()), "SetCallback")?;
+        let detach = |e: String| {
+            let _ = vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
+            e
+        };
+        let null = std::ptr::null_mut::<c_void>();
+        let prepared = match (&device, &api.gpu) {
+            (Some(dev), Some(g)) => match g.c_prepare_device {
+                Some(slot) => vcall!(codec.0, slot, fn(Raw, Raw) -> i32, dev.0, null),
+                None => {
+                    let (mut p, mut ctx, mut queue) = (0u32, null, null);
+                    check(vcall!(dev.0, g.dev_pipeline, fn(*mut u32, *mut Raw, *mut Raw) -> i32, &mut p, &mut ctx, &mut queue), "GetPipeline")
+                        .map_err(detach)?;
+                    vcall!(codec.0, api.c_prepare_pipeline, fn(u32, Raw, Raw, Raw) -> i32, p, ctx, queue, null)
+                }
+            },
+            _ => vcall!(codec.0, api.c_prepare_pipeline, fn(u32, Raw, Raw, Raw) -> i32, PIPELINE_CPU, null, null, null),
+        };
+        let what = format!("PreparePipeline ({})", gpu.map_or("CPU".to_string(), GpuChoice::label));
+        check(prepared, &what).map_err(detach)?;
         let _ = vcall!(codec.0, api.c_flush, fn() -> i32,);
+        if let Some(hr) = cb.state.lock().unwrap_or_else(PoisonError::into_inner).prepared.take() {
+            check(hr, &what).map_err(detach)?;
+        }
         let name = BSTR::from(path.to_string_lossy().as_ref());
         let mut clip: Raw = std::ptr::null_mut();
         let opened = vcall!(codec.0, api.c_open_clip, fn(*const u16, *mut Raw) -> i32, name.as_ptr(), &mut clip);
@@ -852,12 +1311,15 @@ impl Inner {
             if !clip.is_null() {
                 drop(Com(clip));
             }
-            let _ = vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
-            return Err(if opened < 0 { format!("OpenClip failed ({})", hr_text(opened)) } else { "OpenClip returned nothing".into() });
+            return Err(detach(if opened < 0 { format!("OpenClip failed ({})", hr_text(opened)) } else { "OpenClip returned nothing".into() }));
         }
         let clip = Com(clip);
         let audio = api.audio.as_ref().and_then(|a| query(clip.0, &a.iid).ok());
-        Ok(Inner { rt: rt.clone(), audio, clip, codec, cb })
+        Ok(Inner { rt: rt.clone(), format, audio, clip, codec, device, cb })
+    }
+
+    fn on_gpu(&self) -> bool {
+        self.device.is_some()
     }
 }
 
@@ -903,7 +1365,7 @@ impl WinClip {
             _ => None, // a clip without sound
         };
         let info = ClipInfo { width: w, height: h, frame_rate: rate_from_f32(rate), frame_count: count, audio: audio_info, camera: None, start_timecode: None };
-        let mut pool: Vec<Mutex<Option<Inner>>> = (0..max_decoders()).map(|_| Mutex::new(None)).collect();
+        let mut pool: Vec<Mutex<Option<Inner>>> = (0..max_decoders(first.on_gpu())).map(|_| Mutex::new(None)).collect();
         if let Some(m) = pool.first_mut() {
             *m.get_mut().unwrap_or_else(PoisonError::into_inner) = Some(first);
         }
@@ -994,16 +1456,32 @@ impl WinClip {
 
     fn decode_inner(&self, index: u64, scale: Scale, changes: Option<&Changes>) -> Result<Picture, String> {
         com_init();
-        let api = &self.rt.api;
         // settings are read (once) before the clip is locked for this decode
         let meta = match changes {
-            Some(c) if !c.is_empty() => Some(self.settings_meta()),
+            Some(c) if !c.is_empty() => Some(self.settings_meta().as_slice()),
             _ => None,
         };
-        let slot = self.acquire()?;
+        let mut slot = self.acquire()?;
         let inner = slot.as_ref().ok_or("the clip has no decoder")?;
+        match self.decode_on(inner, index, scale, meta, changes) {
+            Err(e) if inner.on_gpu() => {
+                // the graphics card failed: if the CPU decodes this frame, the card is the
+                // problem, and this decoder (and every one opened from now on) uses the CPU
+                let cpu = Inner::open_on(&self.rt, &self.path, None)?;
+                let pic = self.decode_on(&cpu, index, scale, meta, changes)?;
+                self.rt.disable_gpu(format!("decoding a frame failed: {e}"));
+                *slot = Some(cpu);
+                Ok(pic)
+            }
+            r => r,
+        }
+    }
+
+    /// Decode on one decoder (locked by the caller).
+    fn decode_on(&self, inner: &Inner, index: u64, scale: Scale, meta: Option<&[(Setting, Meta)]>, changes: Option<&Changes>) -> Result<Picture, String> {
+        let api = &self.rt.api;
         let frame = self.read_frame(inner, index)?;
-        check(vcall!(frame.0, api.frame_format, fn(u32) -> i32, FORMAT_RGB_U16), "SetResourceFormat")?;
+        check(vcall!(frame.0, api.frame_format, fn(u32) -> i32, inner.format), "SetResourceFormat")?;
         check(vcall!(frame.0, api.frame_scale, fn(u32) -> i32, scale_code(scale)), "SetResolutionScale")?;
         // Source Settings: clones of the clip's and this frame's processing attributes, changed
         let (clip_attrs, frame_attrs) = match (meta, changes, &api.proc) {
@@ -1022,8 +1500,7 @@ impl WinClip {
         let _ = vcall!(inner.codec.0, api.c_flush, fn() -> i32,);
         drop(frame);
         drop((clip_attrs, frame_attrs));
-        let (w, h, fmt, bytes) = inner.cb.state.lock().unwrap_or_else(PoisonError::into_inner).image.take().ok_or("the runtime did not decode the frame")??;
-        to_picture(w, h, fmt, &bytes)
+        inner.cb.state.lock().unwrap_or_else(PoisonError::into_inner).image.take().ok_or("the runtime did not decode the frame")?
     }
 
     /// The clip's Source Settings, read from the runtime once.
@@ -1382,8 +1859,37 @@ pub fn check_runtime() -> String {
             lines.push(format!("Blackmagic RAW runtime: OK ({})", l.dll.display()));
             lines.extend(l.notes.iter().map(|n| format!("  {n}")));
             lines.push(format!("  audio: {}", if l.api.audio.is_some() { "available" } else { "off" }));
+            lines.push(format!("  decoding on: {}", l.pipeline_text()));
         }
         Err(e) => lines.push(format!("Blackmagic RAW runtime: NOT usable: {e}")),
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discrete_graphics_cards_rank_above_integrated() {
+        assert!(device_rank("NVIDIA GeForce RTX 4070") > device_rank("Intel(R) UHD Graphics 770"));
+        assert!(device_rank("AMD Radeon RX 7800 XT") > device_rank("Intel(R) Iris(R) Xe Graphics"));
+        assert!(device_rank("Intel(R) Arc(TM) A770 Graphics") > device_rank("Intel(R) UHD Graphics"));
+        assert_eq!(device_rank("Some Accelerator"), 1);
+    }
+
+    #[test]
+    fn pipeline_codes_match_the_sdk() {
+        assert_eq!(pipeline_name(fourcc(b"cuda")), "CUDA");
+        assert_eq!(pipeline_name(fourcc(b"opcl")), "OpenCL");
+        assert_eq!(pipeline_name(fourcc(b"cpub")), "CPU");
+        assert_eq!(RESOURCE_CPU, fourcc(b"cpub"));
+        assert_eq!(USAGE_READ_CPU_WRITE_GPU, fourcc(b"rcwg"));
+    }
+
+    #[test]
+    fn decoder_count_is_bounded() {
+        assert!((1..=8).contains(&max_decoders(true)));
+        assert!((1..=8).contains(&max_decoders(false)));
+    }
 }

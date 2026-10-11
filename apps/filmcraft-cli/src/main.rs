@@ -560,7 +560,7 @@ fn braw_check(clip: Option<&str>) -> Result<String, String> {
     }
     // several frames at once, as playback asks for them
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6);
-    for (name, scale) in [("1/2", 0.5f32), ("1/4", 0.25)] {
+    for (name, scale) in [("full", 1.0f32), ("1/2", 0.5), ("1/4", 0.25)] {
         let n = threads * 3;
         let times: Vec<_> = (0..n).map(|_| take()).collect();
         let t = std::time::Instant::now();
@@ -584,6 +584,9 @@ fn braw_check(clip: Option<&str>) -> Result<String, String> {
             n as f64 / s.max(0.000_001),
             if bad > 0 { format!(" ({bad} failed)") } else { String::new() }
         ));
+    }
+    if let Some(on) = filmcraft_platform::braw::runtime().ok().and_then(|r| r.decoding_on()) {
+        out.push(format!("  decoded on: {on}"));
     }
     match src.source_settings() {
         Some(sc) => {
