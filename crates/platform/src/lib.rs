@@ -64,9 +64,10 @@ fn register_braw() {
     if braw::runtime().is_ok() {
         return; // already set (repeated registration, or a test double)
     }
-    #[cfg(target_os = "windows")]
-    braw::set_missing(braw::Missing::Unfinished);
-    #[cfg(not(target_os = "windows"))]
+    // Windows: Blackmagic's installed runtime, loaded at the first `.braw` import (not at startup)
+    #[cfg(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    braw::set_runtime(std::sync::Arc::new(braw::windows::WinRuntime::default()));
+    #[cfg(not(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     braw::set_missing(braw::Missing::Platform);
 }
 

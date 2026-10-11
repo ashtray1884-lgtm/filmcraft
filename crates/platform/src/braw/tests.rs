@@ -195,3 +195,61 @@ fn opener_claims_only_braw_and_explains_a_missing_runtime() {
 
 /// Tests that change the process-wide runtime run one at a time.
 pub(crate) static RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn le(v: &[u16]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+#[test]
+fn processed_image_bytes_become_pictures() {
+    // tight RGB rows
+    let rgb: Vec<u16> = (0..2 * 2 * 3).map(|i| i as u16 * 1000).collect();
+    let p = to_picture(2, 2, FORMAT_RGB_U16, &le(&rgb)).unwrap();
+    assert_eq!((p.width, p.height, p.rgb.clone()), (2, 2, rgb.clone()));
+    // RGBA: alpha dropped
+    let rgba: Vec<u16> = (0..2 * 2 * 4).map(|i| i as u16).collect();
+    let p = to_picture(2, 2, FORMAT_RGBA_U16, &le(&rgba)).unwrap();
+    assert_eq!(p.rgb, vec![0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14]);
+    // padded rows (stride 16 bytes for a 2-pixel RGB row of 12)
+    let mut padded = Vec::new();
+    for row in rgb.chunks(6) {
+        padded.extend(le(row));
+        padded.extend([0xAA; 4]);
+    }
+    assert_eq!(to_picture(2, 2, FORMAT_RGB_U16, &padded).unwrap().rgb, rgb);
+    // refused: short buffer, wrong format, absurd size
+    assert!(to_picture(2, 2, FORMAT_RGB_U16, &le(&rgb[..6])).is_err());
+    assert!(to_picture(2, 2, fourcc(b"rgba"), &le(&rgb)).is_err());
+    assert!(to_picture(0, 2, FORMAT_RGB_U16, &[]).is_err());
+    assert!(to_picture(100_000, 1, FORMAT_RGB_U16, &[]).is_err());
+}
+
+#[test]
+fn fourcc_packs_like_the_sdk() {
+    assert_eq!(fourcc(b"16il"), 0x3136_696C);
+    assert_eq!(FORMAT_RGB_U16, u32::from_be_bytes(*b"16il"));
+}
+
+#[test]
+fn pcm_converts_at_each_depth() {
+    assert_eq!(pcm_to_f32(&[0x00, 0x40, 0x00, 0xC0], 16), vec![0.5, -0.5]);
+    assert_eq!(pcm_to_f32(&[0x00, 0x00, 0x40, 0x00, 0x00, 0xC0], 24), vec![0.5, -0.5]);
+    assert_eq!(pcm_to_f32(&[0, 0, 0, 0x40, 0, 0, 0, 0xC0], 32), vec![0.5, -0.5]);
+    assert!(pcm_to_f32(&[1, 2, 3], 12).is_empty());
+    // a ragged tail is ignored, not read past
+    assert_eq!(pcm_to_f32(&[0x00, 0x40, 0x01], 16).len(), 1);
+}
+
+#[test]
+fn frame_rates_from_the_runtime() {
+    assert_eq!(rate_from_f32(23.976), FrameRate::FPS_23_976);
+    assert_eq!(rate_from_f32(23.976_025), FrameRate::FPS_23_976);
+    assert_eq!(rate_from_f32(29.97), FrameRate::FPS_29_97);
+    assert_eq!(rate_from_f32(59.94), FrameRate::FPS_59_94);
+    assert_eq!(rate_from_f32(24.0), FrameRate::FPS_24);
+    assert_eq!(rate_from_f32(25.0), FrameRate::FPS_25);
+    assert_eq!(rate_from_f32(120.0), FrameRate::FPS_120);
+    assert_eq!(rate_from_f32(12.5), FrameRate { num: 12_500, den: 1000 });
+    assert_eq!(rate_from_f32(f32::NAN).num, 0);
+    assert_eq!(rate_from_f32(-5.0).num, 0);
+}

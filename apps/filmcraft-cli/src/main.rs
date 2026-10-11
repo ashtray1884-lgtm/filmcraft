@@ -88,6 +88,8 @@ SUBCOMMANDS
                                 instead
   export --list-presets [query] list export presets (name, category, format) as JSON
   render --seconds S --out f.png [--scale 0.5]   render one Program frame to PNG
+  braw-check [clip.braw]        Blackmagic RAW: report what the installed runtime offers; with a clip,
+                                open it, time a frame decode and save it as <clip>.filmcraft-check.png
   probe <media> [--image-sequence]
                                 media info as JSON, with MXF / Ogg / BWF details; with
                                 --image-sequence <media> is the first numbered still of a sequence
@@ -278,6 +280,10 @@ async fn cli() {
                 Err(e) => fail(e),
             }
         }
+        "braw-check" => match braw_check(a.pos(1)) {
+            Ok(report) => outln!("{report}"),
+            Err(e) => fail(e),
+        },
         "bench-decode" => {
             let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media>"));
             let n: i64 = a.opt("--frames").and_then(|v| v.parse().ok()).unwrap_or(120);
@@ -501,6 +507,55 @@ fn written_paths(result: &Value, requested: &str) -> Vec<String> {
 }
 
 /// The active sequence at the playhead, or the reason it cannot be rendered (no sequence, bad scale).
+/// `braw-check`: what this machine's Blackmagic RAW runtime offers, and optionally a test decode.
+fn braw_check(clip: Option<&str>) -> Result<String, String> {
+    let mut out = Vec::new();
+    #[cfg(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    out.push(filmcraft_platform::braw::windows::check_runtime());
+    #[cfg(not(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    out.push(filmcraft_platform::braw::missing_message("Blackmagic RAW", &filmcraft_platform::braw::Missing::Platform));
+    let Some(path) = clip else { return Ok(out.join("\n")) };
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+    let reader = filmcraft_media::reader::FileReader::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+    let reader: filmcraft_media::SharedReader = std::sync::Arc::new(reader);
+    let t0 = std::time::Instant::now();
+    let src = filmcraft_platform::braw::reader_opener(&name, &[], &reader).ok_or_else(|| format!("{path}: not a .braw file"))?.map_err(|e| e.to_string())?;
+    let info = src.info();
+    let v = info.video.as_ref().ok_or("no picture in the clip")?;
+    out.push(format!(
+        "{name}: {}×{} at {:.3} fps, {:.1} s, {}, opened in {:.0} ms",
+        v.width,
+        v.height,
+        v.frame_rate.num as f64 / v.frame_rate.den.max(1) as f64,
+        info.duration.seconds(),
+        info.audio().map_or("no audio".to_string(), |a| format!("audio {} ch {} Hz {}-bit", a.channels, a.sample_rate, a.bits_per_sample.unwrap_or(0))),
+        t0.elapsed().as_secs_f64() * 1000.0
+    ));
+    for scale in [1.0f32, 0.25] {
+        let t = std::time::Instant::now();
+        let f = src.video_frame(filmcraft_media::FrameRequest { time: filmcraft_time::Tick::ZERO, scale }).map_err(|e| e.to_string())?;
+        out.push(format!(
+            "  frame 0 at {}: {}×{} decoded in {:.0} ms",
+            if scale < 1.0 { "quarter size" } else { "full size" },
+            f.width,
+            f.height,
+            t.elapsed().as_secs_f64() * 1000.0
+        ));
+        if scale == 1.0 {
+            let png = filmcraft_automation::png_rgba(f.width, f.height, f.to_rgba8(), 1920).map_err(|e| e.to_string())?;
+            let dest = format!("{path}.filmcraft-check.png");
+            std::fs::write(&dest, png).map_err(|e| format!("{dest}: {e}"))?;
+            out.push(format!("  saved {dest}"));
+        }
+    }
+    if info.has_audio() {
+        let a = src.audio(0, 48_000, 48_000).map_err(|e| e.to_string())?;
+        let peak = a.peaks().into_iter().fold(0f32, f32::max);
+        out.push(format!("  audio: first second read, peak {:.1} dBFS", 20.0 * peak.max(1e-9).log10()));
+    }
+    Ok(out.join("\n"))
+}
+
 fn render_at_playhead(s: &Session, scale: f32) -> Result<filmcraft_engine::render::Image, String> {
     s.try_render_program_at(scale, s.playhead()).map_err(|e| e.to_string())
 }

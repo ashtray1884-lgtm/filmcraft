@@ -29,6 +29,10 @@ use filmcraft_frame::{AudioBuffer, Chroma, PixelData, VideoFrame};
 use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedReader, SharedSource, VideoStreamInfo};
 use filmcraft_time::{FrameRate, Tick};
 
+#[cfg(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[allow(unsafe_code)]
+pub mod windows;
+
 /// Media-info codec name.
 pub const CODEC: &str = "Blackmagic RAW";
 /// Largest picture a backend may hand back (each side), against corrupt metadata.
@@ -362,6 +366,65 @@ impl MediaSource for BrawSource {
         }
         Ok(out)
     }
+}
+
+/// A four-character code as the SDK packs it (first character in the high byte).
+pub const fn fourcc(b: &[u8; 4]) -> u32 {
+    (b[0] as u32) << 24 | (b[1] as u32) << 16 | (b[2] as u32) << 8 | b[3] as u32
+}
+/// Interleaved RGB, 16 bits per component (`blackmagicRawResourceFormatRGBU16`).
+pub const FORMAT_RGB_U16: u32 = fourcc(b"16il");
+/// Interleaved RGBA, 16 bits per component.
+pub const FORMAT_RGBA_U16: u32 = fourcc(b"16al");
+
+/// The common frame rates a float from the runtime stands for.
+pub fn rate_from_f32(fps: f32) -> FrameRate {
+    let f = fps as f64;
+    for r in [FrameRate::FPS_23_976, FrameRate::FPS_29_97, FrameRate::FPS_59_94, FrameRate::FPS_119_88, FrameRate { num: 48000, den: 1001 }] {
+        if (f - r.num as f64 / r.den as f64).abs() < 0.005 {
+            return r;
+        }
+    }
+    if f.is_finite() && f > 0.0 && (f - f.round()).abs() < 0.005 {
+        return FrameRate { num: f.round() as i64, den: 1 };
+    }
+    if f.is_finite() && f > 0.0 { FrameRate { num: (f * 1000.0).round() as i64, den: 1000 } } else { FrameRate { num: 0, den: 1 } }
+}
+
+/// Little-endian PCM → f32.
+pub fn pcm_to_f32(b: &[u8], bits: u32) -> Vec<f32> {
+    match bits {
+        16 => b.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32_768.0).collect(),
+        24 => b.chunks_exact(3).map(|s| ((i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32) / 8_388_608.0).collect(),
+        32 => b.chunks_exact(4).map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f32 / 2_147_483_648.0).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The processed image's bytes → a [`Picture`] (RGB or RGBA 16-bit, rows possibly padded).
+pub fn to_picture(w: u32, h: u32, fmt: u32, bytes: &[u8]) -> Result<Picture, String> {
+    let comps = match fmt {
+        FORMAT_RGB_U16 => 3usize,
+        FORMAT_RGBA_U16 => 4,
+        other => return Err(format!("the runtime returned resource format 0x{other:08X}, not RGB 16-bit")),
+    };
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err(format!("the runtime returned a {w}×{h} picture"));
+    }
+    let (wu, hu) = (w as usize, h as usize);
+    let row = wu * comps * 2;
+    let stride = if bytes.len() >= row * hu && bytes.len().is_multiple_of(hu) { bytes.len() / hu } else { row };
+    if stride < row || bytes.len() < stride * (hu - 1) + row {
+        return Err(format!("the runtime returned {} bytes for a {w}×{h} picture", bytes.len()));
+    }
+    let mut rgb = Vec::with_capacity(wu * hu * 3);
+    for y in 0..hu {
+        let line = bytes.get(y * stride..y * stride + row).ok_or("picture row out of range")?;
+        for px in line.chunks_exact(comps * 2) {
+            rgb.extend((0..3).map(|c| u16::from_le_bytes([px[c * 2], px[c * 2 + 1]])));
+        }
+    }
+    Ok(Picture { width: w, height: h, rgb })
 }
 
 /// An in-memory [`Runtime`] for tests: clips are generated, not read.
