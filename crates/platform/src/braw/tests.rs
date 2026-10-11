@@ -300,5 +300,8 @@ fn settings_reach_the_decoder() {
         }
     }
     let p = BrawSource::new("p.braw", Arc::new(Plain(rt.info.clone())), None).unwrap();
-    assert!(p.source_settings().is_none() && p.with_source_settings(&serde_json::json!({"exposure": 1})).is_none());
+    // no settings: the schema says why, and nothing can be set
+    let sc = p.source_settings().unwrap();
+    assert!(sc["settings"].as_array().unwrap().is_empty() && sc["message"].as_str().unwrap().contains("not available"));
+    assert!(p.with_source_settings(&serde_json::json!({"exposure": 1})).is_none());
 }

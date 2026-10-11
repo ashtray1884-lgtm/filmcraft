@@ -120,6 +120,10 @@ pub trait Clip: Send + Sync {
     fn settings(&self) -> Vec<Setting> {
         Vec::new()
     }
+    /// Why [`Clip::settings`] is empty, for Clip ▸ Source Settings (`None`: no reason known).
+    fn settings_note(&self) -> Option<String> {
+        None
+    }
     /// Decode with `changes` (setting key → value, already checked against [`Clip::settings`])
     /// applied over the as-shot settings.
     fn decode_with(&self, index: u64, scale: Scale, changes: &Changes) -> Result<Picture, String> {
@@ -374,14 +378,19 @@ pub fn picture_to_frame(p: &Picture) -> Result<VideoFrame, String> {
     const MAX: f32 = 65_535.0;
     const MID: f32 = 32_768.0;
     let q = |v: f32| v.round().clamp(0.0, MAX) as u16;
-    for (i, px) in p.rgb.chunks_exact(3).enumerate() {
-        let (Some(dy), Some(db), Some(dr)) = (y.get_mut(i), cb.get_mut(i), cr.get_mut(i)) else { break };
-        let [r, g, b] = [px[0], px[1], px[2]].map(|v| v as f32 / MAX);
-        let [yy, u, v] = rgb_to_ycbcr(r, g, b, Matrix::Bt709);
-        *dy = q(yy * MAX);
-        *db = q(u * MAX + MID);
-        *dr = q(v * MAX + MID);
-    }
+    // Rec.709 matrix on code values: each colour's (Y, Cb, Cr) response (the 1/65535 normalisation cancels out)
+    let [kr, kg, kb] = [rgb_to_ycbcr(1.0, 0.0, 0.0, Matrix::Bt709), rgb_to_ycbcr(0.0, 1.0, 0.0, Matrix::Bt709), rgb_to_ycbcr(0.0, 0.0, 1.0, Matrix::Bt709)];
+    // rows in parallel: a 6K frame is 21 million samples
+    let w = p.width as usize;
+    use rayon::prelude::*;
+    p.rgb.par_chunks(w * 3).zip(y.par_chunks_mut(w)).zip(cb.par_chunks_mut(w)).zip(cr.par_chunks_mut(w)).for_each(|(((src, dy), db), dr)| {
+        for (((px, oy), ob), or) in src.chunks_exact(3).zip(dy.iter_mut()).zip(db.iter_mut()).zip(dr.iter_mut()) {
+            let [r, g, b] = [px[0] as f32, px[1] as f32, px[2] as f32];
+            *oy = q(kr[0] * r + kg[0] * g + kb[0] * b);
+            *ob = q(kr[1] * r + kg[1] * g + kb[1] * b + MID);
+            *or = q(kr[2] * r + kg[2] * g + kb[2] * b + MID);
+        }
+    });
     Ok(VideoFrame {
         width: p.width,
         height: p.height,
@@ -419,7 +428,10 @@ impl MediaSource for BrawSource {
     fn source_settings(&self) -> Option<serde_json::Value> {
         let settings = self.clip.settings();
         if settings.is_empty() {
-            return None;
+            let why = self.clip.settings_note().unwrap_or_else(|| "Blackmagic's runtime reported no adjustable settings for this clip.".into());
+            return Some(
+                serde_json::json!({"kind": "braw", "title": "Blackmagic RAW", "settings": [], "message": format!("Blackmagic RAW settings are not available: {why}")}),
+            );
         }
         let list: Vec<serde_json::Value> = settings.iter().map(|st| st.to_json(self.changes.get(st.key).unwrap_or(&st.as_shot))).collect();
         Some(serde_json::json!({"kind": "braw", "title": "Blackmagic RAW", "settings": list}))
@@ -533,13 +545,17 @@ pub fn to_picture(w: u32, h: u32, fmt: u32, bytes: &[u8]) -> Result<Picture, Str
     if stride < row || bytes.len() < stride * (hu - 1) + row {
         return Err(format!("the runtime returned {} bytes for a {w}×{h} picture", bytes.len()));
     }
-    let mut rgb = Vec::with_capacity(wu * hu * 3);
-    for y in 0..hu {
-        let line = bytes.get(y * stride..y * stride + row).ok_or("picture row out of range")?;
-        for px in line.chunks_exact(comps * 2) {
-            rgb.extend((0..3).map(|c| u16::from_le_bytes([px[c * 2], px[c * 2 + 1]])));
+    let mut rgb = vec![0u16; wu * hu * 3];
+    use rayon::prelude::*;
+    rgb.par_chunks_mut(wu * 3).enumerate().for_each(|(y, out)| {
+        // in range: checked above (stride * (h - 1) + row <= len)
+        let Some(line) = bytes.get(y * stride..y * stride + row) else { return };
+        for (px, o) in line.chunks_exact(comps * 2).zip(out.chunks_exact_mut(3)) {
+            for (c, v) in o.iter_mut().enumerate() {
+                *v = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+            }
         }
-    }
+    });
     Ok(Picture { width: w, height: h, rgb })
 }
 

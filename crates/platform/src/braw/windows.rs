@@ -787,30 +787,36 @@ impl Runtime for WinRuntime {
     }
 }
 
+/// Decoders a clip may have at once, each with its own codec, clip and callback: one decoder
+/// finishes one frame per `FlushJobs`, so playback's workers would otherwise wait on each other.
+/// `FILMCRAFT_BRAW_DECODERS` (1–8) overrides it.
+fn max_decoders() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let env = std::env::var("FILMCRAFT_BRAW_DECODERS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        env.unwrap_or(if cores >= 12 { 3 } else { 2 }).clamp(1, 8)
+    })
+}
+
+/// One decoder of a clip.
 struct Inner {
-    // drop order: clip and audio, then codec (after detaching the callback), then the callback
+    rt: Arc<Loaded>,
+    // drop order (after Drop below has flushed and detached the callback): clip and audio, then
+    // the codec, then the callback
     audio: Option<Com>,
     clip: Com,
     codec: Com,
     cb: Box<Callback>,
 }
 
-struct WinClip {
-    rt: Arc<Loaded>,
-    info: ClipInfo,
-    inner: Mutex<Inner>,
-    /// Source Settings read from the runtime at first use (empty: none).
-    settings: OnceLock<Vec<(Setting, Meta)>>,
-}
-
-impl Drop for WinClip {
+impl Drop for Inner {
     fn drop(&mut self) {
         com_init();
-        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
         let api = &self.rt.api;
-        let _ = vcall!(inner.codec.0, api.c_flush, fn() -> i32,);
-        let _ = vcall!(inner.codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
-        let mut st = inner.cb.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = vcall!(self.codec.0, api.c_flush, fn() -> i32,);
+        let _ = vcall!(self.codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
+        let mut st = self.cb.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, f)) = st.read.take()
             && f != 0
         {
@@ -819,8 +825,8 @@ impl Drop for WinClip {
     }
 }
 
-impl WinClip {
-    fn open(rt: Arc<Loaded>, path: &Path) -> Result<WinClip, String> {
+impl Inner {
+    fn open(rt: &Arc<Loaded>, path: &Path) -> Result<Inner, String> {
         com_init();
         let api = &rt.api;
         // created before the codec so that, on an early return, the codec is released first
@@ -833,40 +839,128 @@ impl WinClip {
         let codec = Com(codec);
         check(vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, cb.as_raw()), "SetCallback")?;
         let null = std::ptr::null_mut::<c_void>();
-        check(vcall!(codec.0, api.c_prepare_pipeline, fn(u32, Raw, Raw, Raw) -> i32, PIPELINE_CPU, null, null, null), "PreparePipeline (CPU)")?;
+        let prepared = vcall!(codec.0, api.c_prepare_pipeline, fn(u32, Raw, Raw, Raw) -> i32, PIPELINE_CPU, null, null, null);
+        if let Err(e) = check(prepared, "PreparePipeline (CPU)") {
+            let _ = vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
+            return Err(e);
+        }
         let _ = vcall!(codec.0, api.c_flush, fn() -> i32,);
         let name = BSTR::from(path.to_string_lossy().as_ref());
         let mut clip: Raw = std::ptr::null_mut();
-        check(vcall!(codec.0, api.c_open_clip, fn(*const u16, *mut Raw) -> i32, name.as_ptr(), &mut clip), "OpenClip")?;
-        if clip.is_null() {
-            return Err("OpenClip returned nothing".into());
+        let opened = vcall!(codec.0, api.c_open_clip, fn(*const u16, *mut Raw) -> i32, name.as_ptr(), &mut clip);
+        if opened < 0 || clip.is_null() {
+            if !clip.is_null() {
+                drop(Com(clip));
+            }
+            let _ = vcall!(codec.0, api.c_set_callback, fn(Raw) -> i32, std::ptr::null_mut());
+            return Err(if opened < 0 { format!("OpenClip failed ({})", hr_text(opened)) } else { "OpenClip returned nothing".into() });
         }
         let clip = Com(clip);
+        let audio = api.audio.as_ref().and_then(|a| query(clip.0, &a.iid).ok());
+        Ok(Inner { rt: rt.clone(), audio, clip, codec, cb })
+    }
+}
+
+struct WinClip {
+    rt: Arc<Loaded>,
+    path: PathBuf,
+    info: ClipInfo,
+    /// The clip's decoders: the first is opened with the clip (and also reads sound and
+    /// settings); the others are opened when every open one is busy.
+    pool: Vec<Mutex<Option<Inner>>>,
+    /// Opening another decoder failed: stay with those there are.
+    pool_full: std::sync::atomic::AtomicBool,
+    /// Source Settings read from the runtime at first use (empty: none).
+    settings: OnceLock<Vec<(Setting, Meta)>>,
+}
+
+type Slot<'a> = std::sync::MutexGuard<'a, Option<Inner>>;
+
+impl WinClip {
+    fn open(rt: Arc<Loaded>, path: &Path) -> Result<WinClip, String> {
+        let first = Inner::open(&rt, path)?;
+        let api = &rt.api;
+        let clip = &first.clip;
         let (mut w, mut h, mut rate, mut count) = (0u32, 0u32, 0f32, 0u64);
         check(vcall!(clip.0, api.clip_width, fn(*mut u32) -> i32, &mut w), "GetWidth")?;
         check(vcall!(clip.0, api.clip_height, fn(*mut u32) -> i32, &mut h), "GetHeight")?;
         check(vcall!(clip.0, api.clip_rate, fn(*mut f32) -> i32, &mut rate), "GetFrameRate")?;
         check(vcall!(clip.0, api.clip_count, fn(*mut u64) -> i32, &mut count), "GetFrameCount")?;
-        let (audio, audio_info) = match &api.audio {
-            Some(a) => match query(clip.0, &a.iid) {
-                Ok(au) => {
-                    let (mut bits, mut ch, mut sr, mut n) = (0u32, 0u32, 0u32, 0u64);
-                    let ok = vcall!(au.0, a.bits, fn(*mut u32) -> i32, &mut bits) >= 0
-                        && vcall!(au.0, a.channels, fn(*mut u32) -> i32, &mut ch) >= 0
-                        && vcall!(au.0, a.rate, fn(*mut u32) -> i32, &mut sr) >= 0
-                        && vcall!(au.0, a.count, fn(*mut u64) -> i32, &mut n) >= 0;
-                    if ok && matches!(bits, 16 | 24 | 32) && ch > 0 && sr > 0 && n > 0 {
-                        (Some(au), Some(AudioInfo { sample_rate: sr, channels: ch, bits_per_sample: bits, sample_count: n }))
-                    } else {
-                        (None, None)
-                    }
-                }
-                Err(_) => (None, None), // a clip without sound
-            },
-            None => (None, None),
+        let audio_info = match (&api.audio, &first.audio) {
+            (Some(a), Some(au)) => {
+                let (mut bits, mut ch, mut sr, mut n) = (0u32, 0u32, 0u32, 0u64);
+                let ok = vcall!(au.0, a.bits, fn(*mut u32) -> i32, &mut bits) >= 0
+                    && vcall!(au.0, a.channels, fn(*mut u32) -> i32, &mut ch) >= 0
+                    && vcall!(au.0, a.rate, fn(*mut u32) -> i32, &mut sr) >= 0
+                    && vcall!(au.0, a.count, fn(*mut u64) -> i32, &mut n) >= 0;
+                (ok && matches!(bits, 16 | 24 | 32) && ch > 0 && sr > 0 && n > 0).then_some(AudioInfo {
+                    sample_rate: sr,
+                    channels: ch,
+                    bits_per_sample: bits,
+                    sample_count: n,
+                })
+            }
+            _ => None, // a clip without sound
         };
         let info = ClipInfo { width: w, height: h, frame_rate: rate_from_f32(rate), frame_count: count, audio: audio_info, camera: None, start_timecode: None };
-        Ok(WinClip { rt: rt.clone(), info, inner: Mutex::new(Inner { audio, clip, codec, cb }), settings: OnceLock::new() })
+        let mut pool: Vec<Mutex<Option<Inner>>> = (0..max_decoders()).map(|_| Mutex::new(None)).collect();
+        if let Some(m) = pool.first_mut() {
+            *m.get_mut().unwrap_or_else(PoisonError::into_inner) = Some(first);
+        }
+        Ok(WinClip { rt, path: path.to_path_buf(), info, pool, pool_full: Default::default(), settings: OnceLock::new() })
+    }
+
+    /// The first decoder (sound, settings), waiting for it if it is busy.
+    fn first(&self) -> Result<Slot<'_>, String> {
+        let m = self.pool.first().ok_or("the clip has no decoder")?;
+        Ok(m.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// A decoder no other thread is using: an idle open one, else a newly opened one, else the
+    /// first (waiting for it).
+    fn acquire(&self) -> Result<Slot<'_>, String> {
+        use std::sync::TryLockError;
+        use std::sync::atomic::Ordering;
+        fn try_slot(m: &Mutex<Option<Inner>>) -> Option<Slot<'_>> {
+            match m.try_lock() {
+                Ok(g) => Some(g),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            }
+        }
+        for m in &self.pool {
+            if let Some(g) = try_slot(m)
+                && g.is_some()
+            {
+                return Ok(g);
+            }
+        }
+        if !self.pool_full.load(Ordering::Relaxed) {
+            for m in self.pool.iter().skip(1) {
+                if let Some(mut g) = try_slot(m)
+                    && g.is_none()
+                {
+                    match Inner::open(&self.rt, &self.path) {
+                        Ok(i) => {
+                            *g = Some(i);
+                            log::info!(
+                                "Blackmagic RAW: decoder {} of {} opened for {}",
+                                1 + self.pool.iter().position(|x| std::ptr::eq(x, m)).unwrap_or(0),
+                                self.pool.len(),
+                                self.path.display()
+                            );
+                            return Ok(g);
+                        }
+                        Err(e) => {
+                            log::warn!("Blackmagic RAW: no further decoder for {}: {e}", self.path.display());
+                            self.pool_full.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.first()
     }
 }
 
@@ -906,8 +1000,9 @@ impl WinClip {
             Some(c) if !c.is_empty() => Some(self.settings_meta()),
             _ => None,
         };
-        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let frame = self.read_frame(&inner, index)?;
+        let slot = self.acquire()?;
+        let inner = slot.as_ref().ok_or("the clip has no decoder")?;
+        let frame = self.read_frame(inner, index)?;
         check(vcall!(frame.0, api.frame_format, fn(u32) -> i32, FORMAT_RGB_U16), "SetResourceFormat")?;
         check(vcall!(frame.0, api.frame_scale, fn(u32) -> i32, scale_code(scale)), "SetResolutionScale")?;
         // Source Settings: clones of the clip's and this frame's processing attributes, changed
@@ -936,7 +1031,8 @@ impl WinClip {
         self.settings.get_or_init(|| {
             let Some(pr) = &self.rt.api.proc else { return Vec::new() };
             com_init();
-            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let Ok(slot) = self.first() else { return Vec::new() };
+            let Some(inner) = slot.as_ref() else { return Vec::new() };
             let mut out = Vec::new();
             if let Ok(ca) = clone_attrs(inner.clip.0, pr.clip_clone) {
                 for e in CATALOG.iter().filter(|e| !e.frame) {
@@ -946,7 +1042,7 @@ impl WinClip {
                 }
             }
             // per-frame settings (ISO, white balance, exposure): as shot on the first frame
-            match self.read_frame(&inner, 0).and_then(|f| clone_attrs(f.0, pr.frame_clone)) {
+            match self.read_frame(inner, 0).and_then(|f| clone_attrs(f.0, pr.frame_clone)) {
                 Ok(fa) => {
                     for e in CATALOG.iter().filter(|e| e.frame) {
                         if let Some(x) = describe(fa.0, &pr.frame, e) {
@@ -980,11 +1076,19 @@ impl Clip for WinClip {
         self.decode_inner(index, scale, Some(changes))
     }
 
+    fn settings_note(&self) -> Option<String> {
+        if self.rt.api.proc.is_some() {
+            return None;
+        }
+        let note = self.rt.notes.iter().find_map(|n| n.strip_prefix("source settings off: "));
+        Some(format!("this Blackmagic RAW runtime ({}) does not offer them to FilmCraft ({}).", self.rt.dll.display(), note.unwrap_or("unknown reason")))
+    }
+
     fn audio(&self, start: u64, frames: usize) -> Result<Vec<f32>, String> {
         com_init();
         let (Some(a), Some(ai)) = (&self.rt.api.audio, &self.info.audio) else { return Err("no audio".into()) };
-        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(au) = &inner.audio else { return Err("no audio".into()) };
+        let slot = self.first()?;
+        let Some(au) = slot.as_ref().and_then(|i| i.audio.as_ref()) else { return Err("no audio".into()) };
         let ch = ai.channels as usize;
         let bytes_per = (ai.bits_per_sample / 8) as usize;
         let want = frames.min(1 << 20);

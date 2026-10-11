@@ -45,8 +45,15 @@ pub(crate) fn query(s: &mut Session, p: &Value) -> Result<Value> {
     let codec = m.info.video.as_ref().map(|v| v.codec.clone()).or_else(|| m.info.audio().map(|a| a.codec.clone())).unwrap_or_default();
     let container = m.info.container.clone();
     let changed = m.interpret.source_settings.clone().unwrap_or_else(|| json!({}));
-    if let Some(sc) = schema(s, id) {
+    let sc = schema(s, id);
+    if let Some(sc) = &sc
+        && sc["settings"].as_array().is_some_and(|l| !l.is_empty())
+    {
         return Ok(json!({"item": id.0, "codec": codec, "container": container, "raw": sc, "changed": changed}));
+    }
+    // camera raw whose decoder offers nothing to set: its reason
+    if let Some(msg) = sc.as_ref().and_then(|sc| sc["message"].as_str()) {
+        return Ok(json!({"item": id.0, "codec": codec, "container": container, "settings": [], "message": msg}));
     }
     Ok(json!({
         "item": id.0,
@@ -86,7 +93,7 @@ pub(crate) fn check_value(entry: &Value, v: &Value) -> std::result::Result<Value
 
 pub(crate) fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let id = target(s, p)?;
-    let sc = schema(s, id).ok_or_else(|| bad("this clip has no source settings"))?;
+    let sc = schema(s, id).filter(|sc| sc["settings"].as_array().is_some_and(|l| !l.is_empty())).ok_or_else(|| bad("this clip has no source settings"))?;
     let entries = sc["settings"].as_array().cloned().unwrap_or_default();
     let reset = p.get("reset").and_then(Value::as_bool).unwrap_or(false);
     let mut cur: Map<String, Value> = if reset {

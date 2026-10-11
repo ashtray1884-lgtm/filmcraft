@@ -1737,7 +1737,7 @@ pub(crate) const CLIP_MENU: &[&[(&str, &str)]] = &[
         ("Clear", "edit.clear"),
         ("Ripple Delete", "edit.rippleDelete"),
     ],
-    &[("Edit Original", "edit.editOriginal"), ("Replace With Clip From Source Monitor", "clip.replaceFromSource")],
+    &[("Edit Original", "edit.editOriginal"), ("Source Settings…", "clip.sourceSettings"), ("Replace With Clip From Source Monitor", "clip.replaceFromSource")],
     &[
         ("Enable", "clip.enable"),
         ("Link", "clip.link"),
@@ -2492,6 +2492,12 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 let r = ui.add_enabled(!sel.is_empty() && app.session.is_enabled(cmd), egui::Button::new(label));
                 app.auto.add(&format!("timeline.clipMenu.{cmd}"), r.rect, label);
                 if r.clicked() {
+                    // Source Settings act on the media of the clip right-clicked
+                    if cmd == "clip.sourceSettings"
+                        && let Some(item) = picked.first().map(|it| it.item.0)
+                    {
+                        let _ = app.session.execute("project.select", json!({"items": [item]}));
+                    }
                     match crate::menus::invoke(app, &ctx, cmd, json!({})) {
                         // Unlink (#220): the clips were selected together because they were linked;
                         // keep only the one right-clicked, so it can be dragged away from the others

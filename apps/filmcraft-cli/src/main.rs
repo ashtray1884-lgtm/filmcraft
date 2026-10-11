@@ -531,24 +531,59 @@ fn braw_check(clip: Option<&str>) -> Result<String, String> {
         info.audio().map_or("no audio".to_string(), |a| format!("audio {} ch {} Hz {}-bit", a.channels, a.sample_rate, a.bits_per_sample.unwrap_or(0))),
         t0.elapsed().as_secs_f64() * 1000.0
     ));
-    // the quarter-size decode uses another frame, so the one-frame cache cannot answer it
-    let second = if info.duration > v.frame_rate.tick_of(1) { 1 } else { 0 };
-    for (index, scale) in [(0i64, 1.0f32), (second, 0.25)] {
+    // decode speed at each size, each on frames not decoded before (the source keeps the last frame)
+    let frames = (info.duration.0 / v.frame_rate.tick_of(1).0.max(1)).max(1);
+    let mut next = 0i64;
+    let mut take = || {
+        let f = next % frames;
+        next += 1;
+        v.frame_rate.tick_of(f)
+    };
+    let request = |time, scale| filmcraft_media::FrameRequest { time, scale };
+    let t = std::time::Instant::now();
+    let f = src.video_frame(request(take(), 1.0)).map_err(|e| e.to_string())?;
+    out.push(format!("  frame 0 at full size: {}×{} decoded in {:.0} ms", f.width, f.height, t.elapsed().as_secs_f64() * 1000.0));
+    let png = filmcraft_automation::png_rgba(f.width, f.height, f.to_rgba8(), 1920).map_err(|e| e.to_string())?;
+    let dest = format!("{path}.filmcraft-check.png");
+    std::fs::write(&dest, png).map_err(|e| format!("{dest}: {e}"))?;
+    out.push(format!("  saved {dest}"));
+    for (name, scale) in [("full", 1.0f32), ("1/2", 0.5), ("1/4", 0.25), ("1/8", 0.125)] {
+        let n = 3;
         let t = std::time::Instant::now();
-        let f = src.video_frame(filmcraft_media::FrameRequest { time: v.frame_rate.tick_of(index), scale }).map_err(|e| e.to_string())?;
-        out.push(format!(
-            "  frame {index} at {}: {}×{} decoded in {:.0} ms",
-            if scale < 1.0 { "quarter size" } else { "full size" },
-            f.width,
-            f.height,
-            t.elapsed().as_secs_f64() * 1000.0
-        ));
-        if scale == 1.0 {
-            let png = filmcraft_automation::png_rgba(f.width, f.height, f.to_rgba8(), 1920).map_err(|e| e.to_string())?;
-            let dest = format!("{path}.filmcraft-check.png");
-            std::fs::write(&dest, png).map_err(|e| format!("{dest}: {e}"))?;
-            out.push(format!("  saved {dest}"));
+        let mut size = (0, 0);
+        for _ in 0..n {
+            let f = src.video_frame(request(take(), scale)).map_err(|e| e.to_string())?;
+            size = (f.width, f.height);
         }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        out.push(format!("  {name:>4} ({}×{}): {ms:.0} ms a frame, one at a time ({:.1} fps)", size.0, size.1, 1000.0 / ms.max(0.001)));
+    }
+    // several frames at once, as playback asks for them
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6);
+    for (name, scale) in [("1/2", 0.5f32), ("1/4", 0.25)] {
+        let n = threads * 3;
+        let times: Vec<_> = (0..n).map(|_| take()).collect();
+        let t = std::time::Instant::now();
+        let failed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for chunk in times.chunks(3) {
+                let (src, failed) = (&src, &failed);
+                sc.spawn(move || {
+                    for &time in chunk {
+                        if src.video_frame(request(time, scale)).is_err() {
+                            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        let s = t.elapsed().as_secs_f64();
+        let bad = failed.load(std::sync::atomic::Ordering::Relaxed);
+        out.push(format!(
+            "  {name:>4}: {:.1} fps with {threads} frames at once{}",
+            n as f64 / s.max(0.000_001),
+            if bad > 0 { format!(" ({bad} failed)") } else { String::new() }
+        ));
     }
     match src.source_settings() {
         Some(sc) => {

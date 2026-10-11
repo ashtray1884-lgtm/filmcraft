@@ -235,6 +235,16 @@ fn item_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: ItemId, kind: &ItemK
         actions.push(("clip.interpretFootage".into(), json!({"items": [id.0]})));
         ui.close();
     }
+    // camera raw (Blackmagic RAW): gamma, gamut, ISO, white balance, exposure…
+    if matches!(kind, ItemKind::Media(_)) {
+        let b = ui.button(tl!("Source Settings…"));
+        app.auto.add("project.itemMenu.sourceSettings", b.rect, "Source Settings…");
+        if b.clicked() {
+            actions.push(("project.select".into(), sel()));
+            actions.push(("clip.sourceSettings".into(), json!({})));
+            ui.close();
+        }
+    }
     // subclips: Make Subclip (media), Edit Subclip and Convert to Master Clip (subclips)
     let subclip_items: Vec<(&str, &str, &str)> = match kind {
         ItemKind::Media(_) => vec![("makeSubclip", tl!("Make Subclip…"), "clip.makeSubclip")],

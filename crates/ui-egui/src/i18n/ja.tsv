@@ -3544,3 +3544,5 @@
 	Edit Project Notes	プロジェクトメモを編集
 	Notes for this project: to-dos, instructions, frame numbers… Saved with the project.	このプロジェクトのメモ: やること、指示、フレーム番号など… プロジェクトと一緒に保存されます。
 	GPU acceleration is unavailable; preview renders on the CPU	GPU アクセラレーションを利用できません。プレビューは CPU でレンダリングされます
+	Reset to As Shot	撮影時の設定に戻す
+	Set Source Settings	ソース設定を適用

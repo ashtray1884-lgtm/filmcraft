@@ -231,5 +231,17 @@ fn source_settings_dialog_applies_live_cancels_and_keeps() {
     d.click("sourceSettings.ok");
     d.exec("edit.undo", json!({}));
     assert_eq!(d.stored(item), json!({"iso": 1600, "gamma": "Blackmagic Design Custom"}), "undoing the reset keeps the earlier dialog's changes");
+
+    // the Project panel's right-click menu opens it too
+    d.ok("ui.panel.show", json!({"panel": "Project"}));
+    d.exec("project.view.set", json!({"view": "list"}));
+    d.frames(4);
+    let row = format!("project.item.{item}");
+    assert!(d.ids("project.item.").contains(&row), "the clip is listed");
+    d.ok("ui.click", json!({"id": row, "button": "right"}));
+    d.frames(3);
+    d.click("project.itemMenu.sourceSettings");
+    assert!(d.ids("sourceSettings.").iter().any(|i| i == "sourceSettings.gamma"), "dialog open from the Project panel");
+    d.click("sourceSettings.cancel");
     let _ = std::fs::remove_dir_all(&dir);
 }
