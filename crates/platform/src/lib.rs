@@ -34,6 +34,7 @@
 mod annexb;
 #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 mod biplanar;
+pub mod braw;
 pub mod cursor;
 #[cfg(target_os = "macos")]
 pub mod hardware_encode;
@@ -55,6 +56,20 @@ pub mod videotoolbox_encode;
 
 pub use hybrid::HybridDecoder;
 
+/// Blackmagic RAW: the `.braw` opener goes in front of the built-in ones on every system, so a
+/// `.braw` import always explains itself; where a backend exists it decodes with Blackmagic's
+/// installed runtime ([`braw`]).
+fn register_braw() {
+    filmcraft_codecs::register_reader_opener(braw::reader_opener);
+    if braw::runtime().is_ok() {
+        return; // already set (repeated registration, or a test double)
+    }
+    #[cfg(target_os = "windows")]
+    braw::set_missing(braw::Missing::Unfinished);
+    #[cfg(not(target_os = "windows"))]
+    braw::set_missing(braw::Missing::Platform);
+}
+
 /// What [`register`] made available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Availability {
@@ -68,6 +83,7 @@ pub enum Availability {
 /// harmless). Streams they do not take, and every stream while hardware decoding is Off, keep
 /// using FilmCraft's own decoders.
 pub fn register() -> Availability {
+    register_braw();
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     filmcraft_export::register_encoder(nvenc::export::factory);
     #[cfg(target_os = "macos")]

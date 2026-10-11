@@ -21,6 +21,12 @@ pub trait ByteReader: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// The file on disk this reader reads, when it is one. Openers for formats only a vendor
+    /// library can decode (which opens clips by path, such as Blackmagic RAW) need it; everything
+    /// else reads through [`read_at`](Self::read_at).
+    fn path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 pub type SharedReader = Arc<dyn ByteReader>;
@@ -176,6 +182,9 @@ impl Drop for FileReader {
 impl ByteReader for FileReader {
     fn len(&self) -> u64 {
         self.len
+    }
+    fn path(&self) -> Option<&std::path::Path> {
+        Some(&self.path)
     }
     /// Positional reads: threads decoding different parts of the file do not share a cursor.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {

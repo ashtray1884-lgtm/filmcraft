@@ -153,8 +153,18 @@ pub fn probe(path: &str, image_sequence: bool) -> Result<Value, String> {
         });
         return Ok(v);
     }
-    let bytes: Arc<[u8]> = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?.into();
     let name = std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+    // Blackmagic RAW: opened by Blackmagic's runtime from the path (and never read whole: clips
+    // run to many gigabytes), through the same opener import uses
+    if filmcraft_platform::braw::is_braw(path) {
+        let reader = filmcraft_media::reader::FileReader::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+        let reader: filmcraft_media::SharedReader = Arc::new(reader);
+        let src = filmcraft_platform::braw::reader_opener(&name, &[], &reader)
+            .ok_or_else(|| format!("{path}: not a Blackmagic RAW file"))?
+            .map_err(|e| format!("{path}: {e}"))?;
+        return Ok(serde_json::to_value(src.info()).unwrap_or_default());
+    }
+    let bytes: Arc<[u8]> = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?.into();
     let head = &bytes[..bytes.len().min(70_000)];
     if filmcraft_mxf::sniff(head) {
         let src = filmcraft_codecs::MxfSource::open(&name, bytes).map_err(|e| format!("{path}: {e}"))?;
