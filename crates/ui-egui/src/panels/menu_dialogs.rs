@@ -314,7 +314,14 @@ fn defaults(app: &mut FilmcraftApp, cmd: &str, id: &str) -> Result<(Value, Value
             }
             (p, Value::Null)
         }
-        "clip.sourceSettings" => (json!({}), s.execute("clip.sourceSettings", json!({})).map_err(|e| e.to_string())?),
+        "clip.sourceSettings" => {
+            let info = s.execute("clip.sourceSettings", json!({})).map_err(|e| e.to_string())?;
+            let changed = info.get("changed").cloned().unwrap_or_else(|| json!({}));
+            let mut info = info;
+            info["original"] = changed.clone();
+            info["live"] = json!(0);
+            (json!({"item": info["item"], "settings": changed}), info)
+        }
         "clip.updateMetadata" => {
             let n = s.state.project_selection.len().max(s.state.selection.len());
             (json!({}), json!({"count": n}))
@@ -439,6 +446,123 @@ fn color(ui: &mut egui::Ui, elems: &mut Elems, pre: &str, p: &mut Value, key: &s
     });
 }
 
+/// Text for a setting value (numbers without a trailing ".0").
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.as_f64().map_or_else(|| n.to_string(), |x| if x.fract() == 0.0 { format!("{x:.0}") } else { format!("{x}") }),
+        Value::Bool(b) => {
+            if *b {
+                tl!("On").into()
+            } else {
+                tl!("Off").into()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Camera raw Source Settings, grouped as the media lists them. Returns the change to apply now:
+/// `{key: value}` for one setting, or `"reset"` for Reset to As Shot.
+fn source_settings_ui(ui: &mut egui::Ui, elems: &mut Elems, pre: &str, p: &mut Value, schema: &Value) -> Option<Value> {
+    let mut change: Option<Value> = None;
+    let list = schema["settings"].as_array().cloned().unwrap_or_default();
+    let mut groups: Vec<String> = Vec::new();
+    for e in &list {
+        let g = e["group"].as_str().unwrap_or_default().to_string();
+        if !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+        ui.spacing_mut().slider_width = 240.0;
+        for g in &groups {
+            ui.add_space(6.0);
+            ui.label(RichText::new(crate::i18n::t(g)).strong());
+            ui.separator();
+            egui::Grid::new(format!("{pre}.grid.{g}")).num_columns(2).min_col_width(140.0).spacing([14.0, 6.0]).show(ui, |ui| {
+                for e in list.iter().filter(|e| e["group"].as_str() == Some(g.as_str())) {
+                    let key = e["key"].as_str().unwrap_or_default().to_string();
+                    let label = e["label"].as_str().unwrap_or_default().to_string();
+                    let id = format!("{pre}.{key}");
+                    let current = p["settings"].get(&key).cloned().unwrap_or_else(|| e["asShot"].clone());
+                    // a dot marks a setting changed from as shot
+                    let changed_here = p["settings"].get(&key).is_some();
+                    let shown = if changed_here { format!("{} •", crate::i18n::t(&label)) } else { crate::i18n::t(&label).to_string() };
+                    ui.label(&shown);
+                    if e["readOnly"] == true {
+                        ui.label(RichText::new(value_text(&current)).weak());
+                        ui.end_row();
+                        continue;
+                    }
+                    match e["type"].as_str() {
+                        Some("choice") => {
+                            let opts = e["options"].as_array().cloned().unwrap_or_default();
+                            let mut pick: Option<Value> = None;
+                            let r = egui::ComboBox::from_id_salt(&id).selected_text(value_text(&current)).width(240.0).show_ui(ui, |ui| {
+                                for o in &opts {
+                                    let r = ui.selectable_label(*o == current, value_text(o));
+                                    push(elems, format!("{id}.{}", value_text(o)), &r, value_text(o));
+                                    if r.clicked() {
+                                        pick = Some(o.clone());
+                                    }
+                                }
+                            });
+                            push(elems, &id, &r.response, &label);
+                            if let Some(v) = pick
+                                && v != current
+                            {
+                                p["settings"][key.as_str()] = v.clone();
+                                change = Some(json!({ key.as_str(): v }));
+                            }
+                        }
+                        Some("toggle") => {
+                            let mut on = current.as_bool().unwrap_or(false);
+                            let r = ui.checkbox(&mut on, "");
+                            push(elems, &id, &r, &label);
+                            if r.changed() {
+                                p["settings"][key.as_str()] = json!(on);
+                                change = Some(json!({ key.as_str(): on }));
+                            }
+                        }
+                        Some("number") => {
+                            let (lo, hi) = (e["min"].as_f64().unwrap_or(0.0), e["max"].as_f64().unwrap_or(1.0));
+                            let step = e["step"].as_f64().filter(|x| *x > 0.0).unwrap_or(0.01);
+                            let mut v = current.as_f64().unwrap_or(lo);
+                            let r = ui.add(egui::Slider::new(&mut v, lo.min(hi)..=hi.max(lo)).step_by(step));
+                            push(elems, &id, &r, &label);
+                            if r.changed() {
+                                p["settings"][key.as_str()] = json!(v);
+                            }
+                            // decode once the drag ends (a 6K frame is not free), or right away for typed values and clicks
+                            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                                change = Some(json!({ key.as_str(): v }));
+                            }
+                        }
+                        _ => {
+                            ui.label("");
+                        }
+                    }
+                    ui.end_row();
+                    if let Some(n) = e["note"].as_str() {
+                        ui.label("");
+                        ui.label(RichText::new(crate::i18n::t(n)).weak().small());
+                        ui.end_row();
+                    }
+                }
+            });
+        }
+    });
+    ui.add_space(6.0);
+    let r = ui.button(tl!("Reset to As Shot"));
+    push(elems, format!("{pre}.reset"), &r, "Reset to As Shot");
+    if r.clicked() {
+        p["settings"] = json!({});
+        change = Some(json!("reset"));
+    }
+    change
+}
+
 fn pairs(v: &[&str]) -> Vec<(String, String)> {
     v.iter().map(|x| (x.to_string(), x.to_string())).collect()
 }
@@ -453,7 +577,10 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut elems: Elems = Vec::new();
     let mut action: Option<&'static str> = None;
     let mut browse: Option<String> = None;
-    let info_only = matches!(d.command.as_str(), "file.mediaProperties" | "clip.sourceSettings" | "help.systemCompatibilityReport");
+    let raw_settings = d.command == "clip.sourceSettings" && d.info["raw"].is_object();
+    let info_only = matches!(d.command.as_str(), "file.mediaProperties" | "clip.sourceSettings" | "help.systemCompatibilityReport") && !raw_settings;
+    // Source Settings apply live (one undo step per dialog): the change made this frame, if any
+    let mut live: Option<Value> = None;
     // the title is translated; the window keeps one id whatever the interface language
     let id = egui::Id::new(("menu-dialog", pre));
     egui::Window::new(title).id(id).collapsible(false).resizable(false).default_width(420.0).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
@@ -677,7 +804,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             "clip.sourceSettings" => {
                 ui.label(tlf!("Codec: {codec}", codec = d.info["codec"].as_str().unwrap_or_default()));
-                ui.label(RichText::new(d.info["message"].as_str().unwrap_or_default()).weak());
+                if raw_settings {
+                    live = source_settings_ui(ui, &mut elems, pre, p, &d.info["raw"]);
+                } else {
+                    ui.label(RichText::new(d.info["message"].as_str().unwrap_or_default()).weak());
+                }
             }
             "clip.updateMetadata" => {
                 ui.label(tlf!("Write the metadata of the selected clip(s) ({n}) to XMP files next to their media?", n = d.info["count"]));
@@ -831,8 +962,29 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         action = Some("cancel");
     }
+    if let Some(change) = live {
+        // the first change of this dialog starts an undo step; later ones fold into it
+        let n = d.info["live"].as_u64().unwrap_or(0);
+        let mut q = json!({"item": d.params["item"], "merge": n > 0});
+        if change == "reset" {
+            q["reset"] = json!(true);
+        } else {
+            q["settings"] = change;
+        }
+        match app.session.execute("clip.setSourceSettings", q) {
+            Ok(_) => {
+                d.info["live"] = json!(n + 1);
+                d.error.clear();
+            }
+            Err(e) => d.error = e.to_string(),
+        }
+    }
     match action {
         Some("cancel") => {
+            // Source Settings: undo the live changes of this dialog (one merged step)
+            if raw_settings && d.info["live"].as_u64().unwrap_or(0) > 0 {
+                let _ = app.session.execute("edit.undo", json!({}));
+            }
             app.ui.extras.dialog = None;
             return;
         }
@@ -884,6 +1036,7 @@ fn run(app: &mut FilmcraftApp, d: &ClipDialogDraft) -> Result<Option<String>, St
             app.ui.status = tlf!("Saved template {path}", path = r["path"].as_str().unwrap_or_default());
             Ok(None)
         }
+        "clip.sourceSettings" => Ok(None),
         "clip.sceneEditDetection" => {
             s.execute(&d.command, p.clone()).map_err(|e| e.to_string())?;
             app.ui.status = tl!("Scene Edit Detection: analysing in the background (see Progress)").into();

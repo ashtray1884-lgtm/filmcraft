@@ -41,7 +41,8 @@ use windows::Win32::System::Variant::{
 };
 use windows::core::{BSTR, GUID, HSTRING, Interface, PCWSTR, s};
 
-use super::{AudioInfo, Clip, ClipInfo, FORMAT_RGB_U16, Picture, Runtime, Scale, fourcc, pcm_to_f32, rate_from_f32, to_picture};
+use super::{AudioInfo, Changes, Clip, ClipInfo, FORMAT_RGB_U16, Kind, Picture, Runtime, Scale, Setting, fourcc, pcm_to_f32, rate_from_f32, to_picture};
+use serde_json::{Value, json};
 
 type Raw = *mut c_void;
 
@@ -419,6 +420,26 @@ struct Api {
     cb_read: usize,
     cb_process: usize,
     audio: Option<AudioApi>,
+    /// Clip and frame processing attributes (Source Settings), when the runtime describes them.
+    proc: Option<ProcApi>,
+}
+
+/// One of the two processing-attribute interfaces (clip or frame): the same five methods.
+#[derive(Debug)]
+struct AttrApi {
+    get: usize,
+    set: usize,
+    range: usize,
+    list: usize,
+    iso: Option<usize>,
+}
+
+#[derive(Debug)]
+struct ProcApi {
+    clip_clone: usize,
+    frame_clone: usize,
+    clip: AttrApi,
+    frame: AttrApi,
 }
 
 #[derive(Debug)]
@@ -469,6 +490,7 @@ impl Api {
             cb_read: cb.slot("IBlackmagicRawCallback", "ReadComplete", &[P, W32, P], false)?,
             cb_process: cb.slot("IBlackmagicRawCallback", "ProcessComplete", &[P, W32, P], false)?,
             audio: None,
+            proc: None,
         };
         if api.cb_slots <= api.cb_read.max(api.cb_process) || api.cb_slots > 256 {
             return Err(format!("IBlackmagicRawCallback has an unexpected size ({} slots)", api.cb_slots));
@@ -491,6 +513,31 @@ impl Api {
                 samples: a.slot(n, "GetAudioSamples", &[W64, P, W32, W32, P, P], true)?,
             })
         });
+        let attr = |i: &Iface, n: &str, what: &str| -> Result<AttrApi, String> {
+            Ok(AttrApi {
+                get: i.slot(n, &format!("Get{what}Attribute"), &[W32, P], true)?,
+                set: i.slot(n, &format!("Set{what}Attribute"), &[W32, P], true)?,
+                range: i.slot(n, &format!("Get{what}AttributeRange"), &[W32, P, P, P], true)?,
+                list: i.slot(n, &format!("Get{what}AttributeList"), &[W32, P, P, P], true)?,
+                iso: i.slot(n, "GetISOList", &[P, P, P], true).ok(),
+            })
+        };
+        let proc = (|| -> Result<ProcApi, String> {
+            let (ca, fa) = (get("IBlackmagicRawClipProcessingAttributes")?, get("IBlackmagicRawFrameProcessingAttributes")?);
+            Ok(ProcApi {
+                clip_clone: cl.slot("IBlackmagicRawClip", "CloneClipProcessingAttributes", &[P], true)?,
+                frame_clone: fr.slot("IBlackmagicRawFrame", "CloneFrameProcessingAttributes", &[P], true)?,
+                clip: attr(ca, "IBlackmagicRawClipProcessingAttributes", "Clip")?,
+                frame: attr(fa, "IBlackmagicRawFrameProcessingAttributes", "Frame")?,
+            })
+        })();
+        let api = match proc {
+            Ok(pr) => Api { proc: Some(pr), ..api },
+            Err(e) => {
+                notes.push(format!("source settings off: {e}"));
+                api
+            }
+        };
         let api = match audio {
             Some(Ok(a)) => Api { audio: Some(a), ..api },
             Some(Err(e)) => {
@@ -752,6 +799,8 @@ struct WinClip {
     rt: Arc<Loaded>,
     info: ClipInfo,
     inner: Mutex<Inner>,
+    /// Source Settings read from the runtime at first use (empty: none).
+    settings: OnceLock<Vec<(Setting, Meta)>>,
 }
 
 impl Drop for WinClip {
@@ -817,19 +866,14 @@ impl WinClip {
             None => (None, None),
         };
         let info = ClipInfo { width: w, height: h, frame_rate: rate_from_f32(rate), frame_count: count, audio: audio_info, camera: None, start_timecode: None };
-        Ok(WinClip { rt: rt.clone(), info, inner: Mutex::new(Inner { audio, clip, codec, cb }) })
+        Ok(WinClip { rt: rt.clone(), info, inner: Mutex::new(Inner { audio, clip, codec, cb }), settings: OnceLock::new() })
     }
 }
 
-impl Clip for WinClip {
-    fn info(&self) -> &ClipInfo {
-        &self.info
-    }
-
-    fn decode(&self, index: u64, scale: Scale) -> Result<Picture, String> {
-        com_init();
+impl WinClip {
+    /// Read frame `index` (a read job, completed with FlushJobs). Called with the clip locked.
+    fn read_frame(&self, inner: &Inner, index: u64) -> Result<Com, String> {
         let api = &self.rt.api;
-        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         {
             let mut st = inner.cb.state.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some((_, f)) = st.read.take()
@@ -839,7 +883,6 @@ impl Clip for WinClip {
             }
             st.image = None;
         }
-        // read
         let mut job: Raw = std::ptr::null_mut();
         check(vcall!(inner.clip.0, api.clip_read_job, fn(u64, *mut Raw) -> i32, index, &mut job), "CreateJobReadFrame")?;
         let job = Com(job);
@@ -852,19 +895,89 @@ impl Clip for WinClip {
         if frame.0.is_null() {
             return Err("the runtime read no frame".into());
         }
-        // decode and process
+        Ok(frame)
+    }
+
+    fn decode_inner(&self, index: u64, scale: Scale, changes: Option<&Changes>) -> Result<Picture, String> {
+        com_init();
+        let api = &self.rt.api;
+        // settings are read (once) before the clip is locked for this decode
+        let meta = match changes {
+            Some(c) if !c.is_empty() => Some(self.settings_meta()),
+            _ => None,
+        };
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let frame = self.read_frame(&inner, index)?;
         check(vcall!(frame.0, api.frame_format, fn(u32) -> i32, FORMAT_RGB_U16), "SetResourceFormat")?;
         check(vcall!(frame.0, api.frame_scale, fn(u32) -> i32, scale_code(scale)), "SetResolutionScale")?;
+        // Source Settings: clones of the clip's and this frame's processing attributes, changed
+        let (clip_attrs, frame_attrs) = match (meta, changes, &api.proc) {
+            (Some(meta), Some(changes), Some(pr)) => apply_changes(pr, &inner.clip, &frame, meta, changes),
+            _ => (None, None),
+        };
+        let raw = |c: &Option<Com>| c.as_ref().map_or(std::ptr::null_mut(), |c| c.0);
         let mut job: Raw = std::ptr::null_mut();
-        let null = std::ptr::null_mut::<c_void>();
-        check(vcall!(frame.0, api.frame_process_job, fn(Raw, Raw, *mut Raw) -> i32, null, null, &mut job), "CreateJobDecodeAndProcessFrame")?;
+        check(
+            vcall!(frame.0, api.frame_process_job, fn(Raw, Raw, *mut Raw) -> i32, raw(&clip_attrs), raw(&frame_attrs), &mut job),
+            "CreateJobDecodeAndProcessFrame",
+        )?;
         let job = Com(job);
         check(vcall!(job.0, api.job_submit, fn() -> i32,), "Submit (decode)")?;
         drop(job);
         let _ = vcall!(inner.codec.0, api.c_flush, fn() -> i32,);
         drop(frame);
+        drop((clip_attrs, frame_attrs));
         let (w, h, fmt, bytes) = inner.cb.state.lock().unwrap_or_else(PoisonError::into_inner).image.take().ok_or("the runtime did not decode the frame")??;
         to_picture(w, h, fmt, &bytes)
+    }
+
+    /// The clip's Source Settings, read from the runtime once.
+    fn settings_meta(&self) -> &Vec<(Setting, Meta)> {
+        self.settings.get_or_init(|| {
+            let Some(pr) = &self.rt.api.proc else { return Vec::new() };
+            com_init();
+            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut out = Vec::new();
+            if let Ok(ca) = clone_attrs(inner.clip.0, pr.clip_clone) {
+                for e in CATALOG.iter().filter(|e| !e.frame) {
+                    if let Some(x) = describe(ca.0, &pr.clip, e) {
+                        out.push(x);
+                    }
+                }
+            }
+            // per-frame settings (ISO, white balance, exposure): as shot on the first frame
+            match self.read_frame(&inner, 0).and_then(|f| clone_attrs(f.0, pr.frame_clone)) {
+                Ok(fa) => {
+                    for e in CATALOG.iter().filter(|e| e.frame) {
+                        if let Some(x) = describe(fa.0, &pr.frame, e) {
+                            out.push(x);
+                        }
+                    }
+                }
+                Err(e) => log::warn!("Blackmagic RAW: frame settings unavailable: {e}"),
+            }
+            out.sort_by_key(|(s, _)| CATALOG.iter().position(|e| e.key == s.key).unwrap_or(usize::MAX));
+            log::info!("Blackmagic RAW: {} source settings", out.len());
+            out
+        })
+    }
+}
+
+impl Clip for WinClip {
+    fn info(&self) -> &ClipInfo {
+        &self.info
+    }
+
+    fn decode(&self, index: u64, scale: Scale) -> Result<Picture, String> {
+        self.decode_inner(index, scale, None)
+    }
+
+    fn settings(&self) -> Vec<Setting> {
+        self.settings_meta().iter().map(|(s, _)| s.clone()).collect()
+    }
+
+    fn decode_with(&self, index: u64, scale: Scale, changes: &Changes) -> Result<Picture, String> {
+        self.decode_inner(index, scale, Some(changes))
     }
 
     fn audio(&self, start: u64, frames: usize) -> Result<Vec<f32>, String> {
@@ -893,6 +1006,267 @@ impl Clip for WinClip {
         let used = (got_bytes as usize).min(buf.len());
         Ok(pcm_to_f32(buf.get(..used).unwrap_or_default(), ai.bits_per_sample))
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Source Settings: processing attributes
+
+/// A setting FilmCraft offers when the clip has it: attribute four-character code from the SDK
+/// manual's BlackmagicRawClipProcessingAttribute / BlackmagicRawFrameProcessingAttribute tables.
+struct Entry {
+    key: &'static str,
+    label: &'static str,
+    group: &'static str,
+    attr: u32,
+    /// A frame processing attribute (ISO, white balance, exposure) rather than a clip one.
+    frame: bool,
+    /// An on/off setting (stored by the runtime as a number or boolean).
+    toggle: bool,
+    note: Option<&'static str>,
+}
+
+const CUSTOM_NOTE: Option<&str> = Some("Applies with Blackmagic Design Custom gamma (chosen automatically when changed)");
+
+const fn entry(key: &'static str, label: &'static str, group: &'static str, code: &[u8; 4], frame: bool, toggle: bool, note: Option<&'static str>) -> Entry {
+    Entry { key, label, group, attr: fourcc(code), frame, toggle, note }
+}
+
+static CATALOG: [Entry; 21] = [
+    entry("iso", "ISO", "Image", b"fiso", true, false, None),
+    entry("kelvin", "Color Temp", "Image", b"wbkv", true, false, None),
+    entry("tint", "Tint", "Image", b"wbtn", true, false, None),
+    entry("exposure", "Exposure", "Image", b"expo", true, false, None),
+    entry("highlightRecovery", "Highlight Recovery", "Image", b"hlry", false, true, None),
+    entry("gamma", "Gamma", "Color", b"gama", false, false, None),
+    entry("gamut", "Gamut", "Color", b"gamt", false, false, None),
+    entry("colorScienceGen", "Color Science", "Color", b"csgn", false, false, None),
+    entry("gamutCompression", "Gamut Compression", "Color", b"gace", false, true, None),
+    entry("contrast", "Contrast", "Custom Gamma", b"tcon", false, false, CUSTOM_NOTE),
+    entry("saturation", "Saturation", "Custom Gamma", b"tsat", false, false, None),
+    entry("midpoint", "Midpoint", "Custom Gamma", b"tmid", false, false, None),
+    entry("highlights", "Highlight Rolloff", "Custom Gamma", b"thih", false, false, None),
+    entry("shadows", "Shadow Rolloff", "Custom Gamma", b"tsha", false, false, None),
+    entry("blackLevel", "Black Level", "Custom Gamma", b"tblk", false, false, None),
+    entry("whiteLevel", "White Level", "Custom Gamma", b"twit", false, false, None),
+    entry("videoBlackLevel", "Video Black Level", "Custom Gamma", b"tvbl", false, true, None),
+    entry("lutMode", "3D LUT", "LUT", b"lutm", false, false, None),
+    entry("lensShading", "Lens Shading Correction", "Lens", b"shde", false, true, None),
+    entry("lensDistortion", "Lens Distortion Correction", "Lens", b"dice", false, true, None),
+    entry("chromaticAberration", "Chromatic Aberration Correction", "Lens", b"cace", false, true, None),
+];
+
+/// Changing these switches the gamma to Blackmagic Design Custom (as in DaVinci Resolve).
+const TONE_KEYS: [&str; 8] = ["contrast", "saturation", "midpoint", "highlights", "shadows", "blackLevel", "whiteLevel", "videoBlackLevel"];
+
+/// How to write a setting back: its attribute and the VARIANT type the runtime reported.
+#[derive(Clone, Copy, Debug)]
+struct Meta {
+    attr: u32,
+    frame: bool,
+    vt: u16,
+}
+
+/// A Windows VARIANT (24 bytes on x64 and ARM64: type, three reserved words, 16-byte payload),
+/// cleared with VariantClear when dropped.
+#[repr(C)]
+#[derive(Default)]
+struct Var {
+    vt: u16,
+    reserved: [u16; 3],
+    data: [u64; 2],
+}
+
+impl Drop for Var {
+    fn drop(&mut self) {
+        if self.vt != 0 {
+            // SAFETY: a VARIANT the runtime filled in or we built (BSTRs owned by it); cleared once.
+            let _ = unsafe { windows::Win32::System::Variant::VariantClear((self as *mut Var).cast()) };
+            self.vt = 0;
+        }
+    }
+}
+
+const VT_I2_: u16 = 2;
+const VT_I4_: u16 = 3;
+const VT_R4_: u16 = 4;
+const VT_R8_: u16 = 5;
+const VT_BSTR_: u16 = 8;
+const VT_BOOL_: u16 = 11;
+const VT_UI1_: u16 = 17;
+const VT_UI2_: u16 = 18;
+const VT_UI4_: u16 = 19;
+const VT_INT_: u16 = 22;
+const VT_UINT_: u16 = 23;
+
+/// f32 values shown without float noise (0.1 rather than 0.10000000149).
+fn tidy(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+fn var_to_json(v: &Var) -> Option<Value> {
+    let d = v.data[0];
+    Some(match v.vt {
+        VT_UI1_ => json!(d as u8),
+        VT_I2_ => json!(d as u16 as i16),
+        VT_UI2_ => json!(d as u16),
+        VT_I4_ | VT_INT_ => json!(d as u32 as i32),
+        VT_UI4_ | VT_UINT_ => json!(d as u32),
+        VT_R4_ => json!(tidy(f32::from_bits(d as u32) as f64)),
+        VT_R8_ => json!(f64::from_bits(d)),
+        VT_BOOL_ => json!(d as u16 != 0),
+        VT_BSTR_ => {
+            let p = d as usize as *const u16;
+            if p.is_null() {
+                json!("")
+            } else {
+                // SAFETY: a BSTR: its byte length is the u32 before the first character.
+                let s = unsafe {
+                    let bytes = *(p as *const u32).sub(1) as usize;
+                    String::from_utf16_lossy(std::slice::from_raw_parts(p, (bytes / 2).min(1 << 16)))
+                };
+                json!(s)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// `value` as a VARIANT of type `vt` (the type the runtime uses for the setting).
+fn json_to_var(value: &Value, vt: u16) -> Option<Var> {
+    let num = value.as_f64().or_else(|| value.as_bool().map(|b| if b { 1.0 } else { 0.0 }));
+    let mut v = Var { vt, ..Var::default() };
+    v.data[0] = match vt {
+        VT_UI1_ => num?.round().clamp(0.0, 255.0) as u8 as u64,
+        VT_I2_ => num?.round().clamp(-32_768.0, 32_767.0) as i16 as u16 as u64,
+        VT_UI2_ => num?.round().clamp(0.0, 65_535.0) as u16 as u64,
+        VT_I4_ | VT_INT_ => num?.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32 as u32 as u64,
+        VT_UI4_ | VT_UINT_ => num?.round().clamp(0.0, u32::MAX as f64) as u32 as u64,
+        VT_R4_ => (num? as f32).to_bits() as u64,
+        VT_R8_ => num?.to_bits(),
+        VT_BOOL_ => {
+            if num? != 0.0 {
+                0xFFFF
+            } else {
+                0
+            }
+        }
+        VT_BSTR_ => BSTR::from(value.as_str()?).into_raw() as usize as u64,
+        _ => return None,
+    };
+    Some(v)
+}
+
+fn clone_attrs(obj: Raw, slot: usize) -> Result<Com, String> {
+    let mut out: Raw = std::ptr::null_mut();
+    check(vcall!(obj, slot, fn(*mut Raw) -> i32, &mut out), "clone processing attributes")?;
+    if out.is_null() { Err("no processing attributes".into()) } else { Ok(Com(out)) }
+}
+
+/// A catalog entry as this clip has it: current value, options or range, read-only flag.
+fn describe(attrs: Raw, a: &AttrApi, e: &Entry) -> Option<(Setting, Meta)> {
+    let mut cur = Var::default();
+    if vcall!(attrs, a.get, fn(u32, *mut Var) -> i32, e.attr, &mut cur) < 0 {
+        return None; // not something this clip or camera has
+    }
+    let shot = var_to_json(&cur)?;
+    let meta = Meta { attr: e.attr, frame: e.frame, vt: cur.vt };
+    let mut ro: i32 = 0;
+    // a list of values (gamma, gamut, ISO…)
+    let mut n: u32 = 0;
+    let mut kind = None;
+    if !e.toggle
+        && vcall!(attrs, a.list, fn(u32, *mut Var, *mut u32, *mut i32) -> i32, e.attr, std::ptr::null_mut(), &mut n, &mut ro) >= 0
+        && (1..=512).contains(&n)
+    {
+        let mut arr: Vec<Var> = (0..n).map(|_| Var::default()).collect();
+        let mut got = n;
+        if vcall!(attrs, a.list, fn(u32, *mut Var, *mut u32, *mut i32) -> i32, e.attr, arr.as_mut_ptr(), &mut got, &mut ro) >= 0 {
+            let mut opts: Vec<Value> = arr.iter().take(got.min(n) as usize).filter_map(var_to_json).collect();
+            if !opts.is_empty() {
+                if !opts.contains(&shot) {
+                    opts.insert(0, shot.clone());
+                }
+                kind = Some(Kind::Choice(opts));
+            }
+        }
+    }
+    // ISO on the frame interface: its own list call
+    if kind.is_none()
+        && e.key == "iso"
+        && let Some(slot) = a.iso
+    {
+        let mut n: u32 = 0;
+        if vcall!(attrs, slot, fn(*mut u32, *mut u32, *mut i32) -> i32, std::ptr::null_mut(), &mut n, &mut ro) >= 0 && (1..=512).contains(&n) {
+            let mut arr = vec![0u32; n as usize];
+            let mut got = n;
+            if vcall!(attrs, slot, fn(*mut u32, *mut u32, *mut i32) -> i32, arr.as_mut_ptr(), &mut got, &mut ro) >= 0 {
+                let mut opts: Vec<Value> = arr.iter().take(got.min(n) as usize).map(|v| json!(v)).collect();
+                if !opts.is_empty() {
+                    if !opts.contains(&shot) && shot.is_number() {
+                        opts.insert(0, shot.clone());
+                    }
+                    kind = Some(Kind::Choice(opts));
+                }
+            }
+        }
+    }
+    // a range (white balance, exposure, tone curve) or an on/off
+    if kind.is_none() {
+        let (mut lo, mut hi) = (Var::default(), Var::default());
+        let ranged = vcall!(attrs, a.range, fn(u32, *mut Var, *mut Var, *mut i32) -> i32, e.attr, &mut lo, &mut hi, &mut ro) >= 0;
+        let (lo, hi) = (var_to_json(&lo).and_then(|v| v.as_f64()), var_to_json(&hi).and_then(|v| v.as_f64()));
+        kind = Some(if e.toggle {
+            Kind::Toggle
+        } else if let (true, Some(lo), Some(hi)) = (ranged, lo, hi) {
+            let int = !matches!(cur.vt, VT_R4_ | VT_R8_);
+            Kind::Number { min: lo.min(hi), max: hi.max(lo), step: if int { 1.0 } else { 0.01 } }
+        } else {
+            ro = 1; // nothing to choose from: show it, don't edit it
+            Kind::Number { min: 0.0, max: 0.0, step: 1.0 }
+        });
+    }
+    let kind = kind?;
+    let as_shot = match kind {
+        Kind::Toggle => json!(shot.as_bool().unwrap_or_else(|| shot.as_f64().unwrap_or(0.0) != 0.0)),
+        _ => shot,
+    };
+    Some((Setting { key: e.key, label: e.label, group: e.group, kind, as_shot, read_only: ro != 0, note: e.note }, meta))
+}
+
+/// Clones of the clip's and the frame's processing attributes with `changes` set (`None` for a
+/// side nothing changed on). A value the runtime refuses is logged and skipped.
+fn apply_changes(pr: &ProcApi, clip: &Com, frame: &Com, meta: &[(Setting, Meta)], changes: &Changes) -> (Option<Com>, Option<Com>) {
+    let mut changes = changes.clone();
+    // tone curve settings only act with Blackmagic Design Custom gamma: switch to it, as Resolve does
+    if changes.keys().any(|k| TONE_KEYS.contains(&k.as_str()))
+        && !changes.contains_key("gamma")
+        && let Some((st, _)) = meta.iter().find(|(s, _)| s.key == "gamma")
+        && let Kind::Choice(opts) = &st.kind
+        && let Some(custom) = opts.iter().find(|o| o.as_str().is_some_and(|t| t.contains("Custom")))
+    {
+        changes.insert("gamma".into(), custom.clone());
+    }
+    let (mut ca, mut fa): (Option<Com>, Option<Com>) = (None, None);
+    // gamma and gamut first: the other settings are relative to them
+    let mut keys: Vec<&String> = changes.keys().collect();
+    keys.sort_by_key(|k| match k.as_str() {
+        "gamma" => 0,
+        "gamut" => 1,
+        _ => 2,
+    });
+    for k in keys {
+        let (Some(v), Some((_, m))) = (changes.get(k), meta.iter().find(|(s, _)| s.key == k.as_str())) else { continue };
+        let (target, api, slot, owner) = if m.frame { (&mut fa, &pr.frame, pr.frame_clone, frame) } else { (&mut ca, &pr.clip, pr.clip_clone, clip) };
+        if target.is_none() {
+            *target = clone_attrs(owner.0, slot).ok();
+        }
+        let (Some(t), Some(mut var)) = (target.as_ref(), json_to_var(v, m.vt)) else { continue };
+        let hr = vcall!(t.0, api.set, fn(u32, *mut Var) -> i32, m.attr, &mut var);
+        if hr < 0 {
+            log::warn!("Blackmagic RAW: {k} = {v} refused ({})", hr_text(hr));
+        }
+    }
+    (ca, fa)
 }
 
 /// What this machine has, in words (`filmcraft-cli braw-check`).

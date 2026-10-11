@@ -50,6 +50,7 @@ pub mod settings;
 pub mod shortcut_presets;
 pub mod shortcuts;
 pub mod source_monitor;
+pub mod source_settings;
 pub mod sync;
 pub mod transcript;
 pub mod trim;

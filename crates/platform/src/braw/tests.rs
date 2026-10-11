@@ -253,3 +253,52 @@ fn frame_rates_from_the_runtime() {
     assert_eq!(rate_from_f32(f32::NAN).num, 0);
     assert_eq!(rate_from_f32(-5.0).num, 0);
 }
+
+#[test]
+fn source_settings_schema_and_values() {
+    let rt = FakeRuntime::new(8, 8, FrameRate::FPS_24, 4, None);
+    let s = source(&rt);
+    let sc = s.source_settings().unwrap();
+    assert_eq!(sc["kind"], "braw");
+    let list = sc["settings"].as_array().unwrap();
+    let get = |v: &serde_json::Value, k: &str| v["settings"].as_array().unwrap().iter().find(|e| e["key"] == k).cloned().unwrap();
+    assert_eq!(list.len(), super::fake::fake_settings().len());
+    assert_eq!(get(&sc, "gamma")["type"], "choice");
+    assert_eq!(get(&sc, "exposure")["value"], 0.0);
+    assert_eq!(get(&sc, "colorScienceGen")["readOnly"], true);
+    // with settings: values in effect follow; bad keys and values are dropped, numbers clamped
+    let s2 = s.with_source_settings(&serde_json::json!({"exposure": 9.0, "iso": 1600, "gamma": "nonsense", "bogus": 1, "colorScienceGen": 7})).unwrap();
+    let sc2 = s2.source_settings().unwrap();
+    assert_eq!(get(&sc2, "exposure")["value"], 5.0);
+    assert_eq!(get(&sc2, "iso")["value"], 1600);
+    assert_eq!(get(&sc2, "gamma")["value"], "Blackmagic Design Film");
+    assert_eq!(get(&sc2, "colorScienceGen")["value"], 5);
+}
+
+#[test]
+fn settings_reach_the_decoder() {
+    let rate = FrameRate::FPS_24;
+    let rt = FakeRuntime::new(8, 8, rate, 4, None);
+    let s = source(&rt);
+    let t = rate.tick_of(1);
+    let plain = s.video_frame(FrameRequest::full(t)).unwrap().to_rgba8();
+    let brighter = s.with_source_settings(&serde_json::json!({"exposure": 1.0})).unwrap().video_frame(FrameRequest::full(t)).unwrap().to_rgba8();
+    assert!(brighter[1] > plain[1], "one stop up is brighter: {} vs {}", brighter[1], plain[1]);
+    let grey = s.with_source_settings(&serde_json::json!({"saturation": 0.0})).unwrap().video_frame(FrameRequest::full(t)).unwrap().to_rgba8();
+    assert!((grey[0] as i32 - grey[1] as i32).abs() <= 1 && (grey[1] as i32 - grey[2] as i32).abs() <= 1, "saturation 0 is grey: {:?}", &grey[..3]);
+    // a clip without settings has no schema and no settings variant
+    struct Plain(ClipInfo);
+    impl Clip for Plain {
+        fn info(&self) -> &ClipInfo {
+            &self.0
+        }
+        fn decode(&self, _: u64, _: Scale) -> Result<Picture, String> {
+            Ok(Picture { width: 1, height: 1, rgb: vec![0; 3] })
+        }
+        fn audio(&self, _: u64, _: usize) -> Result<Vec<f32>, String> {
+            Ok(vec![])
+        }
+    }
+    let p = BrawSource::new("p.braw", Arc::new(Plain(rt.info.clone())), None).unwrap();
+    assert!(p.source_settings().is_none() && p.with_source_settings(&serde_json::json!({"exposure": 1})).is_none());
+}

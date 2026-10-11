@@ -173,7 +173,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             has_offline_selection,
             edit_offline,
         ),
-        query("clip.sourceSettings", "Source Settings…", &["Clip"], None, r#"{"item":id?}"#, has_media_selection, source_settings),
+        query("clip.sourceSettings", "Source Settings…", &["Clip"], None, r#"{"item":id?}"#, has_media_selection, crate::source_settings::query),
+        spec(
+            "clip.setSourceSettings",
+            "Set Source Settings",
+            &[],
+            None,
+            r#"{"item":id?,"settings":{key:value|null}?,"reset":bool?,"merge":bool?} (keys and allowed values: clip.sourceSettings → raw.settings)"#,
+            always,
+            crate::source_settings::set,
+        ),
         spec("clip.restoreCaptionsFromSource", "Restore Captions from Source Clip", &["Clip"], None, "{}", no_embedded_captions, |_, _| {
             Err(EngineError::Other(NO_CAPTIONS.into()))
         }),
@@ -1041,19 +1050,6 @@ fn edit_offline(s: &mut Session, p: &Value) -> Result<Value> {
     })?;
     let it = s.project.item(id).ok_or_else(|| bad("clip.editOffline", "no such item"))?;
     Ok(json!({"item": id.0, "name": it.name, "metadata": it.metadata}))
-}
-
-fn source_settings(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = targets(s, p).into_iter().find(|i| media_of(&s.project, *i).is_some()).ok_or_else(|| EngineError::Other("select a clip".into()))?;
-    let (_, m) = media_of(&s.project, id).ok_or_else(|| EngineError::Other("select a clip".into()))?;
-    let codec = m.info.video.as_ref().map(|v| v.codec.clone()).or_else(|| m.info.audio().map(|a| a.codec.clone())).unwrap_or_default();
-    Ok(json!({
-        "item": id.0,
-        "codec": codec,
-        "container": m.info.container,
-        "settings": [],
-        "message": format!("{} has no source settings in FilmCraft. Source settings apply to camera raw formats (R3D, ARRIRAW, CinemaDNG, ProRes RAW…), which FilmCraft does not decode.", if codec.is_empty() { "This clip".to_string() } else { codec.to_uppercase() }),
-    }))
 }
 
 fn xml_escape(s: &str) -> String {

@@ -178,6 +178,10 @@ pub struct Interpretation {
     /// is edited into a sequence. None = one stereo clip of the first two channels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<AudioChannelMap>,
+    /// Clip ▸ Source Settings (camera raw, e.g. Blackmagic RAW): the settings changed from the
+    /// clip's as-shot values, as setting key → value. None = decode as shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_settings: Option<serde_json::Value>,
 }
 
 /// Modify ▸ Audio Channels: the clip channel format and, per audio clip, the source channels it

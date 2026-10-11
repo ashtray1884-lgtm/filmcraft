@@ -531,11 +531,13 @@ fn braw_check(clip: Option<&str>) -> Result<String, String> {
         info.audio().map_or("no audio".to_string(), |a| format!("audio {} ch {} Hz {}-bit", a.channels, a.sample_rate, a.bits_per_sample.unwrap_or(0))),
         t0.elapsed().as_secs_f64() * 1000.0
     ));
-    for scale in [1.0f32, 0.25] {
+    // the quarter-size decode uses another frame, so the one-frame cache cannot answer it
+    let second = if info.duration > v.frame_rate.tick_of(1) { 1 } else { 0 };
+    for (index, scale) in [(0i64, 1.0f32), (second, 0.25)] {
         let t = std::time::Instant::now();
-        let f = src.video_frame(filmcraft_media::FrameRequest { time: filmcraft_time::Tick::ZERO, scale }).map_err(|e| e.to_string())?;
+        let f = src.video_frame(filmcraft_media::FrameRequest { time: v.frame_rate.tick_of(index), scale }).map_err(|e| e.to_string())?;
         out.push(format!(
-            "  frame 0 at {}: {}×{} decoded in {:.0} ms",
+            "  frame {index} at {}: {}×{} decoded in {:.0} ms",
             if scale < 1.0 { "quarter size" } else { "full size" },
             f.width,
             f.height,
@@ -547,6 +549,37 @@ fn braw_check(clip: Option<&str>) -> Result<String, String> {
             std::fs::write(&dest, png).map_err(|e| format!("{dest}: {e}"))?;
             out.push(format!("  saved {dest}"));
         }
+    }
+    match src.source_settings() {
+        Some(sc) => {
+            let list = sc["settings"].as_array().cloned().unwrap_or_default();
+            out.push(format!("  source settings: {}", list.len()));
+            for st in &list {
+                let opts = match st["type"].as_str() {
+                    Some("choice") => format!(" of {}", st["options"].as_array().map_or(0, Vec::len)),
+                    Some("number") => format!(" {}…{}", st["min"], st["max"]),
+                    _ => String::new(),
+                };
+                let ro = if st["readOnly"] == true { ", read-only" } else { "" };
+                out.push(format!("    {} = {} ({}{opts}{ro})", st["label"].as_str().unwrap_or("?"), st["asShot"], st["type"].as_str().unwrap_or("?")));
+            }
+            // one change, decoded: proves the settings reach the runtime
+            let exposure = list.iter().find(|s| s["key"] == "exposure" && s["readOnly"] != true);
+            if let (Some(e), Some(changed)) = (exposure, exposure.and_then(|_| src.with_source_settings(&json!({"exposure": 1.0})))) {
+                let t = std::time::Instant::now();
+                let f = changed.video_frame(filmcraft_media::FrameRequest { time: filmcraft_time::Tick::ZERO, scale: 0.25 }).map_err(|e| e.to_string())?;
+                let base = src.video_frame(filmcraft_media::FrameRequest { time: filmcraft_time::Tick::ZERO, scale: 0.25 }).map_err(|e| e.to_string())?;
+                let mean = |px: Vec<u8>| px.iter().map(|&b| b as f64).sum::<f64>() / px.len().max(1) as f64;
+                out.push(format!(
+                    "  exposure {} → +1 stop: decoded in {:.0} ms, mean level {:.1} → {:.1}",
+                    e["asShot"],
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    mean(base.to_rgba8()),
+                    mean(f.to_rgba8())
+                ));
+            }
+        }
+        None => out.push("  source settings: none".into()),
     }
     if info.has_audio() {
         let a = src.audio(0, 48_000, 48_000).map_err(|e| e.to_string())?;

@@ -112,10 +112,105 @@ pub struct Picture {
 /// several), so they synchronise internally.
 pub trait Clip: Send + Sync {
     fn info(&self) -> &ClipInfo;
-    /// Decode frame `index` (0-based) at `scale`.
+    /// Decode frame `index` (0-based) at `scale`, as shot.
     fn decode(&self, index: u64, scale: Scale) -> Result<Picture, String>;
     /// `frames` sample frames from `start`, interleaved, as f32 in -1..1. Fewer at the end.
     fn audio(&self, start: u64, frames: usize) -> Result<Vec<f32>, String>;
+    /// The clip's Source Settings with their as-shot values (empty: none).
+    fn settings(&self) -> Vec<Setting> {
+        Vec::new()
+    }
+    /// Decode with `changes` (setting key → value, already checked against [`Clip::settings`])
+    /// applied over the as-shot settings.
+    fn decode_with(&self, index: u64, scale: Scale, changes: &Changes) -> Result<Picture, String> {
+        let _ = changes;
+        self.decode(index, scale)
+    }
+}
+
+/// Settings changed from as shot: key → value.
+pub type Changes = serde_json::Map<String, serde_json::Value>;
+
+/// How a setting is edited.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Kind {
+    Number {
+        min: f64,
+        max: f64,
+        step: f64,
+    },
+    Toggle,
+    /// One of these values (text or numbers).
+    Choice(Vec<serde_json::Value>),
+}
+
+/// One Source Setting of a clip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Setting {
+    /// Stable id (`gamma`, `iso`, `saturation`…), stored in projects.
+    pub key: &'static str,
+    pub label: &'static str,
+    /// Dialog section.
+    pub group: &'static str,
+    pub kind: Kind,
+    pub as_shot: serde_json::Value,
+    pub read_only: bool,
+    /// A short note shown under the control.
+    pub note: Option<&'static str>,
+}
+
+impl Setting {
+    /// `value` checked against this setting: numbers clamped, choices listed, toggles boolean.
+    pub fn check(&self, value: &serde_json::Value) -> Option<serde_json::Value> {
+        if self.read_only {
+            return None;
+        }
+        match &self.kind {
+            Kind::Number { min, max, .. } => value.as_f64().filter(|x| x.is_finite()).map(|x| serde_json::json!(x.clamp(*min, *max))),
+            Kind::Toggle => value.as_bool().map(serde_json::Value::Bool),
+            Kind::Choice(opts) => opts.iter().find(|o| *o == value || (o.is_number() && value.as_f64() == o.as_f64() && value.is_number())).cloned(),
+        }
+    }
+
+    /// This setting as schema JSON, with the value in effect.
+    pub fn to_json(&self, value: &serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "key": self.key, "label": self.label, "group": self.group,
+            "value": value, "asShot": self.as_shot, "readOnly": self.read_only,
+        });
+        match &self.kind {
+            Kind::Number { min, max, step } => {
+                v["type"] = "number".into();
+                v["min"] = (*min).into();
+                v["max"] = (*max).into();
+                v["step"] = (*step).into();
+            }
+            Kind::Toggle => v["type"] = "toggle".into(),
+            Kind::Choice(o) => {
+                v["type"] = "choice".into();
+                v["options"] = o.clone().into();
+            }
+        }
+        if let Some(n) = self.note {
+            v["note"] = n.into();
+        }
+        v
+    }
+}
+
+/// Keep only the changes `settings` allows (unknown keys and bad values dropped, numbers clamped).
+pub fn sanitize(settings: &[Setting], changes: &serde_json::Value) -> Changes {
+    let mut out = Changes::new();
+    if let Some(o) = changes.as_object() {
+        for (k, v) in o {
+            if let Some(st) = settings.iter().find(|s| s.key == k.as_str())
+                && let Some(ok) = st.check(v)
+            {
+                out.insert(k.clone(), ok);
+            }
+        }
+    }
+    out
 }
 
 /// A Blackmagic RAW decoder: opens clips by path.
@@ -204,6 +299,8 @@ pub struct BrawSource {
     info: MediaInfo,
     /// The last frame decoded: (index, scale, frame).
     last: Mutex<Option<(u64, Scale, Arc<VideoFrame>)>>,
+    /// Source Settings changed from as shot (checked against the clip's settings).
+    changes: Changes,
 }
 
 impl BrawSource {
@@ -254,7 +351,7 @@ impl BrawSource {
             start_timecode: ci.start_timecode,
             file_size,
         };
-        Ok(Self { clip, info, last: Mutex::new(None) })
+        Ok(Self { clip, info, last: Mutex::new(None), changes: Changes::new() })
     }
 
     fn frame_index(&self, t: Tick) -> u64 {
@@ -312,10 +409,29 @@ impl MediaSource for BrawSource {
         {
             return Ok(f.clone());
         }
-        let pic = self.clip.decode(index, scale).map_err(|e| MediaError::Decode(format!("{}: frame {index}: {e}", self.info.name)))?;
+        let pic = if self.changes.is_empty() { self.clip.decode(index, scale) } else { self.clip.decode_with(index, scale, &self.changes) }
+            .map_err(|e| MediaError::Decode(format!("{}: frame {index}: {e}", self.info.name)))?;
         let frame = Arc::new(picture_to_frame(&pic).map_err(|e| MediaError::Decode(format!("{}: frame {index}: {e}", self.info.name)))?.with_pts(pts));
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((index, scale, frame.clone()));
         Ok(frame)
+    }
+
+    fn source_settings(&self) -> Option<serde_json::Value> {
+        let settings = self.clip.settings();
+        if settings.is_empty() {
+            return None;
+        }
+        let list: Vec<serde_json::Value> = settings.iter().map(|st| st.to_json(self.changes.get(st.key).unwrap_or(&st.as_shot))).collect();
+        Some(serde_json::json!({"kind": "braw", "title": "Blackmagic RAW", "settings": list}))
+    }
+
+    fn with_source_settings(&self, settings: &serde_json::Value) -> Option<SharedSource> {
+        let all = self.clip.settings();
+        if all.is_empty() {
+            return None;
+        }
+        let changes = sanitize(&all, settings);
+        Some(Arc::new(BrawSource { clip: self.clip.clone(), info: self.info.clone(), last: Mutex::new(None), changes }))
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {

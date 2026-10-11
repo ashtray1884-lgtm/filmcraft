@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use filmcraft_engine::Session;
-use filmcraft_platform::braw::{self, AudioInfo, Clip, ClipInfo, Missing, Picture, Runtime, Scale};
+use filmcraft_platform::braw::{self, AudioInfo, Changes, Clip, ClipInfo, Kind, Missing, Picture, Runtime, Scale, Setting};
 use filmcraft_time::FrameRate;
 use serde_json::{Value, json};
 
 const RATE: FrameRate = FrameRate::FPS_24;
+
+/// The runtime is process-wide: tests that set it run one at a time.
+static RUNTIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fake;
 struct FakeClip(ClipInfo);
@@ -45,6 +48,37 @@ impl Clip for FakeClip {
     fn decode(&self, index: u64, scale: Scale) -> Result<Picture, String> {
         let (w, h) = (self.0.width.div_ceil(scale.divisor()), self.0.height.div_ceil(scale.divisor()));
         Ok(Picture { width: w, height: h, rgb: [red(index), 20_000, 40_000].repeat((w * h) as usize) })
+    }
+    fn settings(&self) -> Vec<Setting> {
+        vec![
+            Setting {
+                key: "exposure",
+                label: "Exposure",
+                group: "Image",
+                kind: Kind::Number { min: -5.0, max: 5.0, step: 0.1 },
+                as_shot: json!(0.0),
+                read_only: false,
+                note: None,
+            },
+            Setting {
+                key: "gamma",
+                label: "Gamma",
+                group: "Color",
+                kind: Kind::Choice(vec![json!("Blackmagic Design Film"), json!("Blackmagic Design Video")]),
+                as_shot: json!("Blackmagic Design Film"),
+                read_only: false,
+                note: None,
+            },
+        ]
+    }
+    /// Exposure scales red by 2^stops.
+    fn decode_with(&self, index: u64, scale: Scale, changes: &Changes) -> Result<Picture, String> {
+        let mut p = self.decode(index, scale)?;
+        let g = 2f64.powf(changes.get("exposure").and_then(Value::as_f64).unwrap_or(0.0));
+        for px in p.rgb.chunks_exact_mut(3) {
+            px[0] = (px[0] as f64 * g).round().clamp(0.0, 65_535.0) as u16;
+        }
+        Ok(p)
     }
     fn audio(&self, start: u64, frames: usize) -> Result<Vec<f32>, String> {
         let end = (start + frames as u64).min(48_000 * 2);
@@ -90,6 +124,7 @@ fn mean_red(s: &Session, frame: i64) -> f32 {
 
 #[test]
 fn braw_imports_edits_renders_exports_and_reopens() {
+    let _g = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
     filmcraft_codecs::register_reader_opener(braw::reader_opener);
     let dir = Scratch::new("e2e");
     let clip = dir.path("A001_C003.braw");
@@ -147,4 +182,62 @@ fn braw_imports_edits_renders_exports_and_reopens() {
     let mut s2 = Session::default();
     s2.execute("file.open", json!({"path": proj})).unwrap();
     assert!((mean_red(&s2, 10) - lin(22)).abs() < 0.01);
+}
+
+#[test]
+fn braw_source_settings_set_undo_reset_and_reopen() {
+    let _g = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    filmcraft_codecs::register_reader_opener(braw::reader_opener);
+    braw::set_runtime(Arc::new(Fake));
+    let dir = Scratch::new("settings");
+    let clip = dir.path("A001_C004.braw");
+    std::fs::write(&clip, b"x").unwrap();
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "S", "fps": 24.0, "width": 640, "height": 360})).unwrap();
+    let item = s.execute("file.import", json!({"paths": [clip]})).unwrap()["items"][0].as_u64().unwrap();
+    s.execute("timeline.place", json!({"item": item, "track": "V1", "frame": 0})).unwrap();
+    let lin = |i: u64, stops: f64| filmcraft_color::srgb_to_linear(((red(i) as f64 * 2f64.powf(stops)).min(65_535.0) / 65_535.0) as f32);
+
+    // the query lists the clip's settings
+    let q = s.execute("clip.sourceSettings", json!({"item": item})).unwrap();
+    assert_eq!(q["raw"]["kind"], "braw", "{q}");
+    assert_eq!(q["raw"]["settings"].as_array().unwrap().len(), 2);
+    assert!((mean_red(&s, 5) - lin(5, 0.0)).abs() < 0.01);
+
+    // one stop up: brighter in the program monitor
+    s.execute("clip.setSourceSettings", json!({"item": item, "settings": {"exposure": 1.0}})).unwrap();
+    assert!((mean_red(&s, 5) - lin(5, 1.0)).abs() < 0.01, "{} vs {}", mean_red(&s, 5), lin(5, 1.0));
+    let q = s.execute("clip.sourceSettings", json!({"item": item})).unwrap();
+    assert_eq!(q["changed"], json!({"exposure": 1.0}));
+
+    // undo puts the as-shot picture back
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!((mean_red(&s, 5) - lin(5, 0.0)).abs() < 0.01);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert!((mean_red(&s, 5) - lin(5, 1.0)).abs() < 0.01);
+
+    // live dialog drags fold into one undo step
+    s.execute("clip.setSourceSettings", json!({"item": item, "settings": {"exposure": 0.5}, "merge": true})).unwrap();
+    s.execute("clip.setSourceSettings", json!({"item": item, "settings": {"exposure": -1.0}, "merge": true})).unwrap();
+    assert!((mean_red(&s, 5) - lin(5, -1.0)).abs() < 0.01);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!((mean_red(&s, 5) - lin(5, 1.0)).abs() < 0.01, "both merged steps undone together");
+
+    // refused: unknown keys, wrong types, values not offered; nothing changes
+    for bad in [json!({"bogus": 1}), json!({"exposure": "lots"}), json!({"gamma": "Rec.2020"})] {
+        assert!(s.execute("clip.setSourceSettings", json!({"item": item, "settings": bad})).is_err(), "{bad}");
+    }
+    assert!((mean_red(&s, 5) - lin(5, 1.0)).abs() < 0.01);
+
+    // saved with the project and reapplied on open
+    let proj = dir.path("p.fcproj");
+    s.execute("file.save", json!({"path": proj})).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": proj})).unwrap();
+    assert!((mean_red(&s2, 5) - lin(5, 1.0)).abs() < 0.01);
+
+    // reset: as shot again, and nothing stored
+    s2.execute("clip.setSourceSettings", json!({"item": item, "reset": true})).unwrap();
+    assert!((mean_red(&s2, 5) - lin(5, 0.0)).abs() < 0.01);
+    assert_eq!(s2.execute("clip.sourceSettings", json!({"item": item})).unwrap()["changed"], json!({}));
 }

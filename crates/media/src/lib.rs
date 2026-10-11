@@ -166,6 +166,18 @@ pub trait MediaSource: Send + Sync {
     fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
         if stream == 0 { self.audio(start, frames, sample_rate) } else { Err(MediaError::NoStream("audio")) }
     }
+    /// Source Settings (camera raw): what can be set on this media and the values in effect, as
+    /// `{"kind", "title", "settings": [{"key", "label", "group", "type", "value", "asShot", …}]}`.
+    /// `None` for media without decode settings (everything but camera raw).
+    fn source_settings(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// This media decoding with `settings` (an object of setting key → value; keys left out keep
+    /// the as-shot value), sharing what it can with `self`. `None` when the media has no source
+    /// settings. Invalid values are clamped or ignored, never fatal.
+    fn with_source_settings(&self, _settings: &serde_json::Value) -> Option<SharedSource> {
+        None
+    }
 }
 
 pub type SharedSource = Arc<dyn MediaSource>;

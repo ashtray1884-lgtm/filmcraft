@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use filmcraft_time::FrameRate;
 
-use super::{AudioInfo, Clip, ClipInfo, Picture, Runtime, Scale};
+use serde_json::json;
+
+use super::{AudioInfo, Changes, Clip, ClipInfo, Kind, Picture, Runtime, Scale, Setting};
 
 /// Opens any path whose file name does not contain "corrupt" as a generated clip.
 pub struct FakeRuntime {
@@ -49,9 +51,83 @@ pub fn sample(i: u64, c: usize) -> f32 {
     ((i % 1_000) as f32 / 1_000.0) * if c == 0 { 0.5 } else { -0.25 }
 }
 
+/// The settings the fake clip offers (a subset of the real runtime's, with the same keys).
+pub fn fake_settings() -> Vec<Setting> {
+    let n = |key, label, group, min, max, step, shot: f64| Setting {
+        key,
+        label,
+        group,
+        kind: Kind::Number { min, max, step },
+        as_shot: json!(shot),
+        read_only: false,
+        note: None,
+    };
+    vec![
+        Setting {
+            key: "gamma",
+            label: "Gamma",
+            group: "Color",
+            kind: Kind::Choice(vec![json!("Blackmagic Design Film"), json!("Blackmagic Design Video"), json!("Blackmagic Design Custom")]),
+            as_shot: json!("Blackmagic Design Film"),
+            read_only: false,
+            note: None,
+        },
+        Setting {
+            key: "iso",
+            label: "ISO",
+            group: "Image",
+            kind: Kind::Choice(vec![json!(400), json!(800), json!(1600)]),
+            as_shot: json!(800),
+            read_only: false,
+            note: None,
+        },
+        n("exposure", "Exposure", "Image", -5.0, 5.0, 0.1, 0.0),
+        n("saturation", "Saturation", "Custom Gamma", 0.0, 2.0, 0.01, 1.0),
+        Setting {
+            key: "highlightRecovery",
+            label: "Highlight Recovery",
+            group: "Image",
+            kind: Kind::Toggle,
+            as_shot: json!(false),
+            read_only: false,
+            note: None,
+        },
+        Setting {
+            key: "colorScienceGen",
+            label: "Color Science",
+            group: "Color",
+            kind: Kind::Number { min: 0.0, max: 9.0, step: 1.0 },
+            as_shot: json!(5),
+            read_only: true,
+            note: None,
+        },
+    ]
+}
+
 impl Clip for FakeClip {
     fn info(&self) -> &ClipInfo {
         &self.info
+    }
+    fn settings(&self) -> Vec<Setting> {
+        fake_settings()
+    }
+    /// Exposure scales the picture by 2^stops; ISO by iso/800; saturation pulls green and blue
+    /// toward red. Enough to see that settings arrive.
+    fn decode_with(&self, index: u64, scale: Scale, changes: &Changes) -> Result<Picture, String> {
+        let mut p = self.decode(index, scale)?;
+        let stops = changes.get("exposure").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let iso = changes.get("iso").and_then(|v| v.as_f64()).unwrap_or(800.0);
+        let sat = changes.get("saturation").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let gain = 2f64.powf(stops) * iso / 800.0;
+        for px in p.rgb.chunks_exact_mut(3) {
+            let r = px[0] as f64 * gain;
+            let (g, b) = (px[1] as f64 * gain, px[2] as f64 * gain);
+            let mix = |c: f64| r + (c - r) * sat;
+            px[0] = r.round().clamp(0.0, 65_535.0) as u16;
+            px[1] = mix(g).round().clamp(0.0, 65_535.0) as u16;
+            px[2] = mix(b).round().clamp(0.0, 65_535.0) as u16;
+        }
+        Ok(p)
     }
     fn decode(&self, index: u64, scale: Scale) -> Result<Picture, String> {
         if index >= self.info.frame_count {

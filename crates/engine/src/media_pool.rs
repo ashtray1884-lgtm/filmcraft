@@ -65,7 +65,11 @@ pub const PROBE_WHOLE_FILE_MAX: u64 = 64 * 1024 * 1024;
 pub fn media_key(m: &MediaClip) -> String {
     match &m.media {
         MediaRef::File { path } if m.offline => format!("offline:{path}"),
-        MediaRef::File { path } => format!("file:{path}"),
+        // Source Settings (camera raw) change the decoded picture: a change opens the media again
+        MediaRef::File { path } => match &m.interpret.source_settings {
+            Some(st) => format!("file:{path}#source:{st}"),
+            None => format!("file:{path}"),
+        },
         MediaRef::Generator(g) => format!("generator:{g:?}"),
     }
 }
@@ -259,6 +263,10 @@ impl MediaPool {
             } {
                 Ok(s) => {
                     self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+                    let s = match &m.interpret.source_settings {
+                        Some(st) => s.with_source_settings(st).unwrap_or(s),
+                        None => s,
+                    };
                     self.unsupported_as_slate(item, path, s)
                 }
                 Err(_) if filmcraft_media::pending::is_set() => {
@@ -396,6 +404,10 @@ struct UnsupportedAsSlate {
 }
 
 impl MediaSource for UnsupportedAsSlate {
+    /// Source Settings belong to the media underneath (camera raw), not to the slate.
+    fn source_settings(&self) -> Option<serde_json::Value> {
+        self.inner.source_settings()
+    }
     fn info(&self) -> &MediaInfo {
         self.inner.info()
     }
