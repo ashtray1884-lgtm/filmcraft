@@ -2133,6 +2133,7 @@ dependencies = [
 name = "filmcraft-platform"
 version = "0.6.0"
 dependencies = [
+ "cc",
  "filmcraft-audio-dsp",
  "filmcraft-bitstream",
  "filmcraft-codecs",

@@ -80,6 +80,10 @@ windows = { version = "0.62", features = [
 # Linux: libva (VA-API) is loaded at run time with libloading (ISC; already in the lockfile through
 # wgpu), so building needs no libva headers and a system without libva simply decodes in software.
 
+# RED R3D: the C++ bridge to RED's SDK is compiled when FILMCRAFT_R3D_SDK is set (build.rs).
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
 filmcraft-media = { workspace = true }

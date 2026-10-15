@@ -22,6 +22,12 @@ Notes
   If the card can't be used, FilmCraft decodes on the processor instead, automatically.
 - Playback decodes at a reduced size when the monitor is small, so 6K stays smooth; export
   always decodes at full size.
+- RED R3D: .R3D clips (and Nikon N-RAW .NEV) open through RED's own R3D decoder, which ships
+  next to filmcraft.exe (REDR3D-x64.dll and friends, see "RED R3D SDK License Agreement.pdf").
+  Right-click a clip > Source Settings... for RED's settings: ISO, white balance, exposure,
+  color space, gamma, tone map, highlight roll-off, CDL, lens correction. Open the first file
+  of a clip (..._001.R3D); the other parts load with it. Playback at 1/2 or 1/4 resolution is
+  much faster for 6K/8K. "Check Blackmagic RAW.bat" works for an .R3D clip too.
 - Plug-ins: FilmCraft loads your OpenFX video effects and transitions (the versions made for
   DaVinci Resolve: Boris FX, Red Giant, FilmConvert, Neat Video, Dehancer...) and your VST3
   audio effects (FabFilter, iZotope, Waves, Valhalla...). They appear in the Effects panel:

@@ -112,6 +112,12 @@ pub struct Picture {
 /// several), so they synchronise internally.
 pub trait Clip: Send + Sync {
     fn info(&self) -> &ClipInfo;
+    /// The format's name, for media info and the Source Settings title ("Blackmagic RAW",
+    /// "RED R3D"). The same clip machinery serves every camera raw format FilmCraft opens through
+    /// its maker's runtime.
+    fn format(&self) -> &'static str {
+        CODEC
+    }
     /// Decode frame `index` (0-based) at `scale`, as shot.
     fn decode(&self, index: u64, scale: Scale) -> Result<Picture, String>;
     /// `frames` sample frames from `start`, interleaved, as f32 in -1..1. Fewer at the end.
@@ -316,7 +322,8 @@ impl BrawSource {
     /// Validates what the clip reports (metadata from a file is never trusted blindly).
     pub fn new(name: &str, clip: Arc<dyn Clip>, file_size: Option<u64>) -> filmcraft_media::Result<Self> {
         let ci = clip.info().clone();
-        let bad = |what: &str| MediaError::Decode(format!("{name}: Blackmagic RAW clip reports {what}"));
+        let codec = clip.format();
+        let bad = |what: &str| MediaError::Decode(format!("{name}: {} clip reports {what}", clip.format()));
         if ci.width == 0 || ci.height == 0 || ci.width > MAX_SIDE || ci.height > MAX_SIDE {
             return Err(bad(&format!("an invalid picture size {}×{}", ci.width, ci.height)));
         }
@@ -346,8 +353,8 @@ impl BrawSource {
                 frame_rate: ci.frame_rate,
                 par: (1, 1),
                 codec: match &ci.camera {
-                    Some(cam) if !cam.trim().is_empty() => format!("{CODEC} ({})", cam.trim()),
-                    _ => CODEC.to_string(),
+                    Some(cam) if !cam.trim().is_empty() => format!("{codec} ({})", cam.trim()),
+                    _ => codec.to_string(),
                 },
                 pixel_format: "RAW (decoded to RGB 16-bit)".into(),
                 color: FRAME_COLOR,
@@ -356,7 +363,7 @@ impl BrawSource {
                 hdr: None,
             }),
             audio_streams,
-            container: CODEC.into(),
+            container: codec.into(),
             start_timecode: ci.start_timecode,
             file_size,
         };
@@ -433,13 +440,13 @@ impl MediaSource for BrawSource {
     fn source_settings(&self) -> Option<serde_json::Value> {
         let settings = self.clip.settings();
         if settings.is_empty() {
-            let why = self.clip.settings_note().unwrap_or_else(|| "Blackmagic's runtime reported no adjustable settings for this clip.".into());
+            let why = self.clip.settings_note().unwrap_or_else(|| format!("the {} decoder reported no adjustable settings for this clip.", self.clip.format()));
             return Some(
-                serde_json::json!({"kind": "braw", "title": "Blackmagic RAW", "settings": [], "message": format!("Blackmagic RAW settings are not available: {why}")}),
+                serde_json::json!({"kind": "braw", "title": self.clip.format(), "settings": [], "message": format!("{} settings are not available: {why}", self.clip.format())}),
             );
         }
         let list: Vec<serde_json::Value> = settings.iter().map(|st| st.to_json(self.changes.get(st.key).unwrap_or(&st.as_shot))).collect();
-        Some(serde_json::json!({"kind": "braw", "title": "Blackmagic RAW", "settings": list}))
+        Some(serde_json::json!({"kind": "braw", "title": self.clip.format(), "settings": list}))
     }
 
     fn with_source_settings(&self, settings: &serde_json::Value) -> Option<SharedSource> {

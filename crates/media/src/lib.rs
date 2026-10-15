@@ -188,7 +188,8 @@ pub const AUDIO_EXTENSIONS: &[&str] = &["wav", "wave", "bwf", "aif", "aiff", "mp
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "mxf", "mts", "m2ts", "m2t", "ts", "mpg", "mpeg", "vob", "mod", "tod", "m2v", "m1v", "mpv", "3gp", "y4m", "apv",
     // Blackmagic RAW: decoded by Blackmagic's own runtime where it is installed (filmcraft-platform)
-    "braw",
+    "braw", // RED R3D and Nikon N-RAW: decoded by RED's R3D SDK in builds made with it (filmcraft-platform)
+    "r3d", "nev",
 ];
 
 pub fn is_importable(path: &Path) -> bool {

@@ -49,6 +49,8 @@ pub mod nvenc;
 #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
 #[allow(unsafe_code)]
 pub mod ofx;
+/// RED R3D through RED's R3D SDK (in builds made with it).
+pub mod r3d;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod vaapi;
 #[cfg(target_os = "macos")]
@@ -68,6 +70,8 @@ pub use hybrid::HybridDecoder;
 /// `.braw` import always explains itself; where a backend exists it decodes with Blackmagic's
 /// installed runtime ([`braw`]).
 fn register_braw() {
+    // RED R3D next to it: same clip machinery, RED's SDK where the build has it
+    r3d::register();
     filmcraft_codecs::register_reader_opener(braw::reader_opener);
     if braw::runtime().is_ok() {
         return; // already set (repeated registration, or a test double)

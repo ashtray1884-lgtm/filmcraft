@@ -37,6 +37,20 @@ jobs:
         with:
           key: braw-windows-x64
 
+      # RED's free R3D SDK, straight from RED (never stored or shared: its headers and static
+      # library are not redistributable; its decoder DLLs are, unchanged, next to the app).
+      - name: Fetch RED's R3D SDK
+        shell: pwsh
+        run: |
+          $url = 'https://downloads.red.com/software/sdk/R3D/9.2/R3DSDKv9_2_1.zip'
+          try { Invoke-WebRequest -Uri $url -OutFile r3dsdk.zip -UseBasicParsing } catch { Write-Output "::warning::R3D SDK download failed ($_): building without R3D"; exit 0 }
+          $h = (Get-FileHash r3dsdk.zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne '4da91e3394718afbeec701ccc547bc03644e4a2a1c8d7819a7664c8338cbc3df') { Write-Output "::warning::R3D SDK checksum $h is not RED's 9.2.1: building without R3D"; exit 0 }
+          Expand-Archive r3dsdk.zip -DestinationPath r3dsdk
+          $sdk = (Resolve-Path r3dsdk\R3DSDKv9_2_1).Path
+          "FILMCRAFT_R3D_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FILMCRAFT_R3D_LIBS=$sdk\Redistributable\win" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Build OpenFX example plug-ins (test fixtures, BSD-3-Clause; not shipped)
         shell: pwsh
         run: |
@@ -71,7 +85,7 @@ jobs:
         run: |
           $env:FILMCRAFT_OFX_TEST_PLUGINS = (Resolve-Path ofx-test).Path
           $env:FILMCRAFT_VST3_TEST_PLUGINS = (Resolve-Path vst3-test).Path
-          cargo test --release --locked -p filmcraft-platform -- braw ofx vst --nocapture 2>&1 | Tee-Object -FilePath test.log
+          cargo test --release --locked -p filmcraft-platform -- braw ofx vst r3d --nocapture 2>&1 | Tee-Object -FilePath test.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             # the failing lines as annotations (readable through the API without the log)
@@ -120,6 +134,11 @@ jobs:
           Copy-Item 'target\x86_64-pc-windows-msvc\release\filmcraft.exe' $out
           Copy-Item 'target\x86_64-pc-windows-msvc\release\filmcraft-cli.exe' $out
           Copy-Item 'packaging\windows\braw-test\*' $out
+          if ($env:FILMCRAFT_R3D_SDK) {
+            # RED's redistributable decoder libraries (x64), unchanged, and RED's license
+            foreach ($d in 'REDR3D-x64.dll','REDDecoder-x64.dll','REDCuda-x64.dll','REDOpenCL-x64.dll') { Copy-Item "$env:FILMCRAFT_R3D_SDK\Redistributable\win\$d" $out }
+            Copy-Item "$env:FILMCRAFT_R3D_SDK\SDK License Agreement.pdf" "$out\RED R3D SDK License Agreement.pdf"
+          }
           Copy-Item 'LICENSE-MIT','LICENSE-APACHE','NOTICE' $out
           Get-ChildItem $out
 

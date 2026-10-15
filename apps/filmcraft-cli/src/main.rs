@@ -89,7 +89,7 @@ SUBCOMMANDS
   export --list-presets [query] list export presets (name, category, format) as JSON
   render --seconds S --out f.png [--scale 0.5]   render one Program frame to PNG
   plugins                       OpenFX plug-ins: scan the plug-in folders now and list what FilmCraft can use
-  braw-check [clip.braw]        Blackmagic RAW: report what the installed runtime offers; with a clip,
+  braw-check [clip.braw|.R3D]   Blackmagic RAW and RED R3D: report what the installed runtime offers; with a clip,
                                 open it, time a frame decode and save it as <clip>.filmcraft-check.png
   probe <media> [--image-sequence]
                                 media info as JSON, with MXF / Ogg / BWF details; with
@@ -520,12 +520,16 @@ fn braw_check(clip: Option<&str>) -> Result<String, String> {
     out.push(filmcraft_platform::braw::windows::check_runtime());
     #[cfg(not(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     out.push(filmcraft_platform::braw::missing_message("Blackmagic RAW", &filmcraft_platform::braw::Missing::Platform));
+    out.push(filmcraft_platform::r3d::report());
     let Some(path) = clip else { return Ok(out.join("\n")) };
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
     let reader = filmcraft_media::reader::FileReader::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
     let reader: filmcraft_media::SharedReader = std::sync::Arc::new(reader);
     let t0 = std::time::Instant::now();
-    let src = filmcraft_platform::braw::reader_opener(&name, &[], &reader).ok_or_else(|| format!("{path}: not a .braw file"))?.map_err(|e| e.to_string())?;
+    let src = filmcraft_platform::r3d::reader_opener(&name, &[], &reader)
+        .or_else(|| filmcraft_platform::braw::reader_opener(&name, &[], &reader))
+        .ok_or_else(|| format!("{path}: not a .braw or .R3D file"))?
+        .map_err(|e| e.to_string())?;
     let info = src.info();
     let v = info.video.as_ref().ok_or("no picture in the clip")?;
     out.push(format!(

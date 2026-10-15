@@ -590,8 +590,12 @@ impl Instance {
         ctx.projectTimeSamples = s.position;
         ctx.continousTimeSamples = s.position;
         // FilmCraft only processes while playing or rendering: the transport runs
-        ctx.state =
-            (ProcessContext_::StatesAndFlags_::kPlaying | ProcessContext_::StatesAndFlags_::kTempoValid | ProcessContext_::StatesAndFlags_::kTimeSigValid) as u32;
+        #[allow(clippy::unnecessary_cast)] // the flags are i32 on Windows, u32 elsewhere
+        {
+            ctx.state = (ProcessContext_::StatesAndFlags_::kPlaying
+                | ProcessContext_::StatesAndFlags_::kTempoValid
+                | ProcessContext_::StatesAndFlags_::kTimeSigValid) as u32;
+        }
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
