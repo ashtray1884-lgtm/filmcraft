@@ -129,3 +129,109 @@ pub fn poll(app: &mut FilmcraftApp, ctx: &egui::Context) {
     keep.append(&mut app.plugin_editors);
     app.plugin_editors = keep;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filmcraft_project::{EffectDef, EffectKind, ParamDef};
+
+    fn plugin_defs() {
+        let f = |id: &'static str, label: &'static str, min, max, d| ParamDef {
+            id,
+            label,
+            kind: ParamKind::Float { min, max, soft_min: min, soft_max: max, unit: "dB", decimals: 1 },
+            default: ParamValue::Float(d),
+            animatable: true,
+            group: None,
+        };
+        filmcraft_project::register_plugin_effects(vec![
+            EffectDef {
+                id: "ofx:com.test.Glow",
+                name: "Test Glow",
+                kind: EffectKind::Video,
+                category: &["Video Effects", "Test FX"],
+                params: vec![f("amount", "Amount", 0.0, 1.0, 0.5)],
+                intrinsic: false,
+                accelerated: false,
+                float32: true,
+                yuv: false,
+            },
+            EffectDef {
+                id: "vst3:00112233445566778899AABBCCDDEEFF",
+                name: "Test Comp",
+                kind: EffectKind::Audio,
+                category: &["Audio Effects", "Test Audio"],
+                params: vec![
+                    f("p1", "Threshold", -60.0, 0.0, -18.0),
+                    ParamDef {
+                        id: "p2",
+                        label: "Mode",
+                        kind: ParamKind::Choice(&["Clean", "Warm"]),
+                        default: ParamValue::Choice(0),
+                        animatable: false,
+                        group: None,
+                    },
+                ],
+                intrinsic: false,
+                accelerated: false,
+                float32: true,
+                yuv: false,
+            },
+        ]);
+    }
+
+    /// Plug-in effects behave like FilmCraft's own: applied, listed in Effect Controls with their
+    /// rows, set through the usual command, saved with the project (with an audio plug-in's
+    /// state), and a missing plug-in renders the clip unchanged instead of failing.
+    #[test]
+    fn plugin_effects_apply_show_save_and_reload() {
+        plugin_defs();
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let seq = s.active_sequence().unwrap();
+        let vclip = seq.video_tracks[0].items[0].id;
+        let aclip = seq.audio_tracks.iter().flat_map(|t| t.items.iter()).next().map(|i| i.id).expect("demo has audio");
+        s.execute("effects.apply", json!({"clips": [vclip.0], "effect": "ofx:com.test.Glow"})).unwrap();
+        s.execute("effects.apply", json!({"clips": [aclip.0], "effect": "Test Comp"})).unwrap();
+        let vidx =
+            s.active_sequence().unwrap().find_item(vclip).unwrap().1.effects.iter().position(|e| e.effect == "ofx:com.test.Glow").expect("applied by id");
+        let aidx =
+            s.active_sequence().unwrap().find_item(aclip).unwrap().1.effects.iter().position(|e| e.effect.starts_with("vst3:")).expect("applied by name");
+        s.execute("effects.setParam", json!({"clip": vclip.0, "effect": vidx, "param": "amount", "value": 0.8})).unwrap();
+        s.execute("effects.setParam", json!({"clip": aclip.0, "effect": aidx, "param": "p2", "value": "Warm"})).unwrap();
+        s.execute("effects.setPluginState", json!({"clip": aclip.0, "index": aidx, "state": "vst3:1:AAEC:"})).unwrap();
+        assert!(s.execute("effects.setPluginState", json!({"clip": vclip.0, "index": vidx, "state": "x"})).is_err(), "only audio plug-ins have a state");
+
+        // Effect Controls draws the plug-in effect and its rows
+        s.execute("timeline.select", json!({"clips": [vclip.0]})).unwrap();
+        let mut app = crate::FilmcraftApp::new(s);
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &crate::theme::Tokens::for_kind(Default::default()));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+        for _ in 0..3 {
+            app.auto.begin_frame();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| crate::panels::effect_controls::show(&mut app, ui, rect));
+            out.textures_delta.clear();
+        }
+        let ids: Vec<String> = app.auto.query("effectControls.").into_iter().map(|e| e.id.clone()).collect();
+        assert!(ids.iter().any(|i| i == "effectControls.effect.ofx:com.test.Glow"), "{ids:?}");
+        // no plug-in window here (the plug-in is not installed), so no button
+        assert!(!ids.iter().any(|i| i.ends_with(".pluginWindow")));
+
+        // a frame with the missing plug-in still renders (unchanged picture)
+        assert!(app.session.try_render_program_at(0.25, filmcraft_time::Tick::ZERO).is_ok());
+
+        // saved and opened again: effects, values and state come back
+        let path = std::env::temp_dir().join(format!("fc-plugin-effects-{}.fcproj", std::process::id()));
+        app.session.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+        let mut s2 = filmcraft_engine::Session::default();
+        s2.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        let seq = s2.active_sequence().unwrap();
+        let v = &seq.find_item(vclip).unwrap().1.effects[vidx];
+        assert_eq!(v.params["amount"].value, ParamValue::Float(0.8));
+        let a = &seq.find_item(aclip).unwrap().1.effects[aidx];
+        assert_eq!(a.params["p2"].value, ParamValue::Choice(1));
+        assert_eq!(a.params["__state"].value, ParamValue::Text("vst3:1:AAEC:".into()));
+        let _ = std::fs::remove_file(&path);
+    }
+}
