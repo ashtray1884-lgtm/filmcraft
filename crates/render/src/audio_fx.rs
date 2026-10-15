@@ -29,7 +29,19 @@ fn f(e: &EffectInstance, id: &str, mt: Tick) -> f32 {
     e.f64_at(id, mt) as f32
 }
 
+/// The DSP id that stands for an audio plug-in (created by [`crate::external::create_audio_plugin`]).
+pub(crate) const PLUGIN: &str = "plugin";
+
+/// A processor for mapping `m` of effect `e`: FilmCraft's DSP, or the plug-in host's.
+pub(crate) fn create(m: &Mapping, e: &EffectInstance, sr: u32, channels: usize) -> Option<Box<dyn AudioEffect>> {
+    if m.dsp == PLUGIN { crate::external::create_audio_plugin(e, sr, channels) } else { filmcraft_audio_dsp::create_effect(m.dsp, sr as f32, channels) }
+}
+
 pub(crate) fn mapping(id: &str) -> Option<Mapping> {
+    if id.starts_with("vst3:") {
+        // parameters map one to one onto the plug-in's (ids `p<parameter id>`)
+        return Some(Mapping { dsp: PLUGIN, preroll: |e, _| crate::external::audio_plugin_preroll(e), apply: direct });
+    }
     Some(match id {
         "amplify" => Mapping { dsp: "amplify", preroll: |_, _| 0.0, apply: |d, e, t| ignore(d.set_param("gain", f(e, "gain", t))) },
         "dynamics" => Mapping {
@@ -266,14 +278,14 @@ fn direct(d: &mut dyn AudioEffect, e: &EffectInstance, t: Tick) {
 /// effect editors: [`AudioEffect::response_db`] / [`AudioEffect::transfer_db`]).
 pub fn configured(e: &EffectInstance, t: Tick, sample_rate: u32) -> Option<Box<dyn AudioEffect>> {
     let m = mapping(&e.effect)?;
-    let mut d = filmcraft_audio_dsp::create_effect(m.dsp, sample_rate as f32, 2)?;
+    let mut d = create(&m, e, sample_rate, 2)?;
     (m.apply)(d.as_mut(), e, t);
     Some(d)
 }
 
 /// Processing latency (samples) of a project audio effect at `sample_rate`.
 pub fn latency(effect_id: &str, sample_rate: u32) -> usize {
-    mapping(effect_id).and_then(|m| filmcraft_audio_dsp::create_effect(m.dsp, sample_rate as f32, 2)).map_or(0, |d| d.latency())
+    mapping(effect_id).filter(|m| m.dsp != PLUGIN).and_then(|m| filmcraft_audio_dsp::create_effect(m.dsp, sample_rate as f32, 2)).map_or(0, |d| d.latency())
 }
 
 fn shelf(d: &mut dyn AudioEffect, kind: f32, freq: f32, gain: f32) {
@@ -301,6 +313,26 @@ fn active(item: &TrackItem) -> Vec<(&EffectInstance, Mapping)> {
 /// Whether the item has audio effects that change its signal.
 pub fn has_effects(item: &TrackItem) -> bool {
     !active(item).is_empty()
+}
+
+/// Stands in for an effect whose processor cannot be made (a missing plug-in).
+pub(crate) struct Passthrough;
+
+impl AudioEffect for Passthrough {
+    fn id(&self) -> &'static str {
+        "passthrough"
+    }
+    fn params(&self) -> &'static [filmcraft_audio_dsp::ParamSpec] {
+        &[]
+    }
+    fn set_param(&mut self, _id: &str, _value: f32) -> bool {
+        false
+    }
+    fn param(&self, _id: &str) -> Option<f32> {
+        None
+    }
+    fn reset(&mut self) {}
+    fn process(&mut self, _channels: &mut [&mut [f32]]) {}
 }
 
 struct Chain {
@@ -372,9 +404,11 @@ pub fn process(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, 
             let pre_s = act.iter().map(|(e, m)| (m.preroll)(e, mt)).fold(0.0, f64::max);
             let pre = (pre_s * sr as f64).ceil() as usize;
             let mut fx: Vec<Box<dyn AudioEffect>> = Vec::new();
-            for (_, m) in &act {
-                if let Some(d) = filmcraft_audio_dsp::create_effect(m.dsp, sr as f32, width) {
-                    fx.push(d);
+            for (e, m) in &act {
+                match create(m, e, sr, width) {
+                    Some(d) => fx.push(d),
+                    // a plug-in that cannot load passes the sound through (keeps the chain's order)
+                    None => fx.push(Box::new(Passthrough)),
                 }
             }
             let latency = fx.iter().map(|d| d.latency()).sum::<usize>();

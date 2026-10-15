@@ -31,6 +31,7 @@ pub mod monitor_view;
 pub mod multicam;
 pub mod notes;
 pub mod panel_state;
+pub mod plugin_windows;
 pub mod presets;
 pub mod project;
 pub mod project_dialogs;

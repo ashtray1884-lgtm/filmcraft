@@ -2684,6 +2684,41 @@ fn build() -> Vec<CommandSpec> {
                 Ok(json!({"keyframes": keyframes}))
             }
         ),
+        cmd!(
+            "effects.setPluginState",
+            "Set Plug-in State",
+            [],
+            None,
+            r#"{"clip":id,"index":n,"state":str} (an audio plug-in's full state, as its window reports it)"#,
+            has_seq,
+            |s, p| {
+                let c = clip_p(p, "clip").ok_or_else(|| bad("effects.setPluginState", "need `clip`"))?;
+                let idx = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("effects.setPluginState", "need `index`"))? as usize;
+                let state = str_p(p, "state").ok_or_else(|| bad("effects.setPluginState", "need `state`"))?.to_string();
+                if state.len() > 64 << 20 {
+                    return Err(bad("effects.setPluginState", "state too large"));
+                }
+                let merge = format!("pluginState:{}:{idx}", c.0);
+                s.edit_sequence_as("Change Plug-in Settings", Some(&merge), |q, _, _| {
+                    let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                    let e = it
+                        .effects
+                        .get_mut(idx)
+                        .filter(|e| e.effect.starts_with("vst3:"))
+                        .ok_or_else(|| bad("effects.setPluginState", "no audio plug-in at that index"))?;
+                    let v = filmcraft_project::ParamValue::Text(state.clone());
+                    match e.params.get_mut("__state") {
+                        Some(prm) if prm.value == v => {}
+                        Some(prm) => prm.value = v,
+                        None => {
+                            e.params.insert("__state".into(), filmcraft_project::Param::new(v));
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(Value::Null)
+            }
+        ),
         cmd!("effects.toggleAnimation", "Toggle Animation", [], None, r#"{"clip":id,"effect":str|index,"param":str,"mask":n?}"#, has_seq, |s, p| {
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleAnimation", "need `clip`"))?;
             let pid = str_p(p, "param").ok_or_else(|| bad("effects.toggleAnimation", "need `param`"))?.to_string();

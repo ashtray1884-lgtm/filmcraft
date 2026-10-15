@@ -218,6 +218,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if crate::panels::audio_fx_editor::has_editor(&e.effect) {
                     custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
                 }
+                if filmcraft_render::external::plugin_has_window(&e.effect) {
+                    plugin_window_row(app, bui, body, &lane, clip, idx, &e.effect);
+                }
                 for pd in &def.params {
                     param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, it);
                     if app.ui.expanded_fx.contains(&graph_key(clip, idx, pd.id))
@@ -316,6 +319,24 @@ fn custom_setup_row(app: &mut FilmcraftApp, ui: &mut egui::Ui, body: Rect, lane:
     app.auto.add(&format!("effectControls.effect.{effect}.edit"), br, "Edit…");
     if resp.clicked() {
         crate::panels::audio_fx_editor::open(app, crate::panels::audio_fx_editor::FxTarget::Clip { clip: clip.0, index: idx });
+    }
+}
+
+/// An audio plug-in's row that opens its own window.
+fn plugin_window_row(app: &mut FilmcraftApp, ui: &mut egui::Ui, body: Rect, lane: &Rect, clip: ClipId, idx: usize, effect: &str) {
+    let t = app.tokens;
+    let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+    row_line(ui, r, lane, &t);
+    let label = tl!("Open Plug-in Window…");
+    let w = (label.chars().count() as f32 * 6.5 + 16.0).clamp(90.0, 220.0);
+    let br = Rect::from_min_size(pos2(r.min.x + 42.0, r.min.y + 2.0), vec2(w, ROW_H - 4.0));
+    let resp = ui.interact(br, egui::Id::new(("fx-plugin-window", clip.0, idx)), Sense::click());
+    ui.painter().rect_filled(br, 3.0, if resp.hovered() { t.hover } else { t.field_bg });
+    ui.painter().rect_stroke(br, 3.0, Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
+    ui.painter().text(br.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.5), t.text);
+    app.auto.add(&format!("effectControls.effect.{effect}.pluginWindow"), br, "Open Plug-in Window…");
+    if resp.clicked() {
+        crate::panels::plugin_windows::open(app, clip, idx);
     }
 }
 

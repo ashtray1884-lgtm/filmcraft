@@ -52,11 +52,26 @@ jobs:
           }
           Get-ChildItem ofx-test\*.ofx
 
-      - name: Blackmagic RAW and OpenFX tests
+      - name: Build VST3 SDK sample plug-ins (test fixtures, MIT; not shipped)
+        shell: pwsh
+        run: |
+          git clone --quiet --depth 1 https://github.com/steinbergmedia/vst3sdk.git vst3-src
+          git -C vst3-src fetch --quiet --depth 1 origin 3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96
+          git -C vst3-src checkout --quiet 3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96
+          git -C vst3-src submodule update --init --depth 1 base cmake pluginterfaces public.sdk
+          cmake -S vst3-src -B vst3-build -A x64 -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ADD_VSTGUI=OFF -DSMTG_RUN_VST_VALIDATOR=OFF -DSMTG_CREATE_PLUGIN_LINK=OFF -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=OFF -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=ON | Out-Null
+          cmake --build vst3-build --config Release --target adelay again-sample-accurate mda-vst3 sync-delay -- /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path vst3-test | Out-Null
+          foreach ($b in 'adelay','again-sample-accurate','mda-vst3','sync-delay') { Copy-Item -Recurse "vst3-build\VST3\Release\$b.vst3" vst3-test }
+          Get-ChildItem -Recurse vst3-test -Filter *.vst3 | Select-Object FullName
+
+      - name: Blackmagic RAW, OpenFX and VST3 tests
         shell: pwsh
         run: |
           $env:FILMCRAFT_OFX_TEST_PLUGINS = (Resolve-Path ofx-test).Path
-          cargo test --release --locked -p filmcraft-platform -- braw ofx --nocapture
+          $env:FILMCRAFT_VST3_TEST_PLUGINS = (Resolve-Path vst3-test).Path
+          cargo test --release --locked -p filmcraft-platform -- braw ofx vst --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Clippy (platform crate)
@@ -84,6 +99,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path $d | Out-Null
             Copy-Item $f.FullName $d
           }
+          $env:VST3_PATH = (Resolve-Path vst3-test).Path
           & $cli plugins
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

@@ -545,7 +545,8 @@ struct GraphState {
 
 fn build_state(plan: &Plan, sr: u32) -> GraphState {
     let mk = |v: &[Insert], w: usize| -> Vec<Box<dyn AudioEffect>> {
-        v.iter().filter_map(|i| filmcraft_audio_dsp::create_effect(i.map.dsp, sr as f32, w)).collect()
+        // a missing plug-in passes the sound through, keeping every insert in its slot
+        v.iter().map(|i| crate::audio_fx::create(&i.map, &i.effect, sr, w).unwrap_or_else(|| Box::new(crate::audio_fx::Passthrough))).collect()
     };
     let mut strips: Vec<StripState> = plan
         .strips

@@ -146,6 +146,82 @@ pub(crate) fn apply_transition(e: &EffectInstance, a: &Image, b: &Image, p: f32,
     from_ext(&out, &mut img).then_some(img)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Audio plug-ins (VST3)
+
+/// The audio plug-in host: makes a processor for a plug-in effect (its saved state restored),
+/// which FilmCraft then drives like its own effects (parameters by id, blocks in place).
+pub trait AudioPlugins: Send + Sync {
+    fn create(&self, effect: &EffectInstance, sample_rate: u32, channels: usize) -> Option<Box<dyn filmcraft_audio_dsp::AudioEffect>>;
+    /// Seconds of audio a fresh chain runs before the requested range (tails, smoothing).
+    fn preroll(&self, effect: &EffectInstance) -> f64 {
+        let _ = effect;
+        0.5
+    }
+}
+
+static AUDIO: OnceLock<Arc<dyn AudioPlugins>> = OnceLock::new();
+
+/// Install the audio plug-in host (once).
+pub fn set_audio_plugins(x: Arc<dyn AudioPlugins>) {
+    let _ = AUDIO.set(x);
+}
+
+/// A processor for audio plug-in effect `e`, if the host is installed and the plug-in loads.
+pub fn create_audio_plugin(e: &EffectInstance, sample_rate: u32, channels: usize) -> Option<Box<dyn filmcraft_audio_dsp::AudioEffect>> {
+    AUDIO.get()?.create(e, sample_rate, channels)
+}
+
+pub fn audio_plugin_preroll(e: &EffectInstance) -> f64 {
+    AUDIO.get().map_or(0.0, |a| a.preroll(e))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audio plug-in windows
+
+/// What an open plug-in window reports.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowUpdate {
+    /// A parameter of the effect changed in the window (FilmCraft id and value; 0/1 for
+    /// switches, an index for lists).
+    Param(String, f64),
+    /// The plug-in's full state, for the effect's `__state` parameter.
+    State(String),
+    /// The window closed (with the reason if it could not open or failed).
+    Closed(Option<String>),
+}
+
+/// An open plug-in window.
+pub trait PluginWindow: Send {
+    fn poll(&self) -> Vec<WindowUpdate>;
+    fn is_open(&self) -> bool;
+    fn set_param(&self, id: &str, value: f64);
+    fn focus(&self);
+    fn close(&self);
+}
+
+/// Opens plug-ins' own windows (installed by the plug-in host where it can).
+pub trait PluginWindows: Send + Sync {
+    fn has_window(&self, effect_id: &str) -> bool;
+    fn open(&self, effect_id: &str, state: Option<&str>, params: Vec<(String, f64)>) -> Result<Box<dyn PluginWindow>, String>;
+}
+
+static WINDOWS: OnceLock<Arc<dyn PluginWindows>> = OnceLock::new();
+
+pub fn set_plugin_windows(x: Arc<dyn PluginWindows>) {
+    let _ = WINDOWS.set(x);
+}
+
+/// Whether effect `effect_id` is a plug-in with a window FilmCraft can open here.
+pub fn plugin_has_window(effect_id: &str) -> bool {
+    WINDOWS.get().is_some_and(|w| w.has_window(effect_id))
+}
+
+/// Open plug-in effect `effect_id`'s window with its saved state and parameter values restored.
+pub fn open_plugin_window(effect_id: &str, state: Option<&str>, params: Vec<(String, f64)>) -> Result<Box<dyn PluginWindow>, String> {
+    WINDOWS.get().ok_or("plug-in windows are not available on this system")?.open(effect_id, state, params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

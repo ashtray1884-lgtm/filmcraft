@@ -858,7 +858,8 @@ pub fn effect_defs() -> &'static [EffectDef] {
 }
 
 /// Effects and transitions from installed plug-ins (OpenFX), registered at run time once the
-/// plug-in scan finishes: ids start with `ofx:` (effects) or `ofxt:` (transitions).
+/// plug-in scan finishes: ids start with `ofx:` (video effects), `ofxt:` (transitions) or `vst3:`
+/// (audio effects).
 static PLUGIN_DEFS: std::sync::RwLock<Vec<&'static EffectDef>> = std::sync::RwLock::new(Vec::new());
 
 /// Add plug-in effects (definitions live for the rest of the run; an id already registered is
@@ -887,7 +888,7 @@ pub fn all_effect_defs() -> Vec<&'static EffectDef> {
 
 /// Whether `id` names a plug-in effect or transition (rendered by the plug-in host).
 pub fn is_plugin_effect(id: &str) -> bool {
-    id.starts_with("ofx:") || id.starts_with("ofxt:")
+    id.starts_with("ofx:") || id.starts_with("ofxt:") || id.starts_with("vst3:")
 }
 
 pub fn find_effect(id: &str) -> Option<&'static EffectDef> {

@@ -57,6 +57,10 @@ pub mod videotoolbox;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub mod videotoolbox_encode;
+/// VST3 audio plug-in hosting; Windows and Linux on x86-64.
+#[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+pub mod vst;
 
 pub use hybrid::HybridDecoder;
 
@@ -81,7 +85,7 @@ fn register_braw() {
 pub fn plugin_scan_main() -> bool {
     #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
     {
-        ofx::scan_main()
+        ofx::scan_main() || vst::scan_main()
     }
     #[cfg(not(all(any(windows, target_os = "linux"), target_arch = "x86_64")))]
     {
@@ -89,20 +93,23 @@ pub fn plugin_scan_main() -> bool {
     }
 }
 
-/// Start OpenFX plug-in support (effects and transitions from installed plug-ins); the cache of
+/// Start plug-in support: OpenFX video effects and transitions, VST3 audio effects; the caches of
 /// scanned plug-ins lives in `data_dir`. A no-op where plug-ins are not hosted.
 pub fn start_plugins(data_dir: Option<std::path::PathBuf>) {
     #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
-    ofx::start(data_dir);
+    {
+        ofx::start(data_dir.clone());
+        vst::start(data_dir);
+    }
     #[cfg(not(all(any(windows, target_os = "linux"), target_arch = "x86_64")))]
     let _ = data_dir;
 }
 
-/// Scan for OpenFX plug-ins now and report what is installed (`filmcraft-cli plugins`).
+/// Scan for OpenFX and VST3 plug-ins now and report what is installed (`filmcraft-cli plugins`).
 pub fn plugin_report(data_dir: Option<std::path::PathBuf>) -> String {
     #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
     {
-        ofx::scan_and_report(data_dir)
+        format!("{}\n{}", ofx::scan_and_report(data_dir.clone()), vst::scan_and_report(data_dir))
     }
     #[cfg(not(all(any(windows, target_os = "linux"), target_arch = "x86_64")))]
     {

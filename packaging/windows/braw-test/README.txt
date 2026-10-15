@@ -22,4 +22,12 @@ Notes
   If the card can't be used, FilmCraft decodes on the processor instead, automatically.
 - Playback decodes at a reduced size when the monitor is small, so 6K stays smooth; export
   always decodes at full size.
+- Plug-ins: FilmCraft loads your OpenFX video effects and transitions (the versions made for
+  DaVinci Resolve: Boris FX, Red Giant, FilmConvert, Neat Video, Dehancer...) and your VST3
+  audio effects (FabFilter, iZotope, Waves, Valhalla...). They appear in the Effects panel:
+  Video Effects / Video Transitions / Audio Effects, in a folder named after the maker. The
+  first start scans them (a minute or two with many plug-ins); later starts are instant. For an
+  audio plug-in, Effect Controls has "Open Plug-in Window..." for its own interface. Premiere-only
+  plug-ins (.aex / .prm) and VST2 plug-ins are not supported. "Check Plug-ins.bat" lists what
+  FilmCraft found and anything it had to skip.
 - Problems: run "Check Blackmagic RAW.bat" with the clip and send the text it prints.

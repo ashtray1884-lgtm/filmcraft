@@ -11,6 +11,7 @@ rust-version.workspace = true
 # opt in with `#[allow(unsafe_code)]`, and every `unsafe` block carries a `// SAFETY:` comment.
 [lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(filmcraft_wincheck)"] }
 
 [lints.clippy]
 dbg_macro = "warn"
@@ -21,6 +22,7 @@ type_complexity = "allow"
 undocumented_unsafe_blocks = "deny"
 
 [dependencies]
+filmcraft-audio-dsp = { workspace = true }
 filmcraft-bitstream = { workspace = true }
 filmcraft-codecs = { workspace = true }
 filmcraft-color = { workspace = true }
@@ -39,9 +41,17 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# OpenFX plug-ins are loaded at run time with libloading (ISC; already in the lockfile).
+# OpenFX and VST3 plug-ins are loaded at run time with libloading (ISC; already in the lockfile).
+# VST3 interfaces: the `vst3` bindings (MIT OR Apache-2.0), generated from Steinberg's VST 3 SDK
+# headers (MIT since VST 3.8).
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 libloading = "0.8"
+vst3 = "0.3"
+
+# VST3 plug-in windows: plain Win32 windows through windows-sys (MIT OR Apache-2.0; already in the
+# lockfile). `--cfg filmcraft_wincheck` type-checks this code on other systems.
+[target.'cfg(any(windows, filmcraft_wincheck))'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Ole", "Win32_System_Com", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = "0.3.2"

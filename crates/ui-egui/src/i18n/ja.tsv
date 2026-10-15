@@ -3546,3 +3546,6 @@
 	GPU acceleration is unavailable; preview renders on the CPU	GPU アクセラレーションを利用できません。プレビューは CPU でレンダリングされます
 	Reset to As Shot	撮影時の設定に戻す
 	Set Source Settings	ソース設定を適用
+	Open Plug-in Window…	プラグインのウィンドウを開く…
+	The plug-in window could not open	プラグインのウィンドウを開けませんでした
+	The plug-in window closed	プラグインのウィンドウが閉じました
