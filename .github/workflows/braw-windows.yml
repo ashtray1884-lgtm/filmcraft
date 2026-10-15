@@ -71,8 +71,13 @@ jobs:
         run: |
           $env:FILMCRAFT_OFX_TEST_PLUGINS = (Resolve-Path ofx-test).Path
           $env:FILMCRAFT_VST3_TEST_PLUGINS = (Resolve-Path vst3-test).Path
-          cargo test --release --locked -p filmcraft-platform -- braw ofx vst --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --release --locked -p filmcraft-platform -- braw ofx vst --nocapture 2>&1 | Tee-Object -FilePath test.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            # the failing lines as annotations (readable through the API without the log)
+            Select-String -Path test.log -Pattern '^error|panicked|FAILED|^\s+-->' | Select-Object -First 40 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+            exit $code
+          }
 
       - name: Clippy (platform crate)
         continue-on-error: true
@@ -82,8 +87,12 @@ jobs:
         shell: pwsh
         run: |
           $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
-          cargo build --release --locked -p filmcraft -p filmcraft-cli --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked -p filmcraft -p filmcraft-cli --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Select-String -Path build.log -Pattern '^error|^\s+-->' | Select-Object -First 40 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+            exit $code
+          }
 
       - name: Smoke test (no Blackmagic runtime on this machine; must report, not crash)
         shell: pwsh
