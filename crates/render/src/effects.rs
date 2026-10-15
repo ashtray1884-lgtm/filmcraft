@@ -90,6 +90,10 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     if !e.enabled || img.w == 0 || img.h == 0 {
         return;
     }
+    if filmcraft_project::is_plugin_effect(&e.effect) {
+        crate::external::apply_effect(img, e, cx);
+        return;
+    }
     if crate::vfx::apply(img, e, cx) {
         return;
     }

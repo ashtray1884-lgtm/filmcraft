@@ -76,6 +76,11 @@ fn tell(text: &str, error: bool) {
 }
 
 fn main() -> eframe::Result {
+    // A plug-in scan child (FilmCraft runs itself to describe each OpenFX plug-in, so one that
+    // crashes while loading cannot take the editor down): describe, print, exit.
+    if filmcraft_platform::plugin_scan_main() {
+        return Ok(());
+    }
     // First, so the panic hook and every start-up record are logged (`logging`).
     let logger = logging::install();
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
@@ -119,6 +124,8 @@ fn main() -> eframe::Result {
     // Hardware decoding switches them off. Unsupported streams and failures use our decoders.
     register_hardware_decoders();
     register_gpu_frame_renderer();
+    // OpenFX plug-ins: the cached list now, new or changed ones scanned in the background
+    filmcraft_platform::start_plugins(data_dir.clone().or_else(default_data_dir));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FilmCraft")

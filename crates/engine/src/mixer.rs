@@ -1151,7 +1151,7 @@ fn set_default_transition(s: &mut Session, p: &Value) -> Result<Value> {
     let def = find_effect(id)
         .or_else(|| find_transition(id, filmcraft_project::EffectKind::VideoTransition))
         .or_else(|| find_transition(id, filmcraft_project::EffectKind::AudioTransition))
-        .or_else(|| filmcraft_project::effect_defs().iter().find(|d| d.name.eq_ignore_ascii_case(id)))
+        .or_else(|| filmcraft_project::all_effect_defs().into_iter().find(|d| d.name.eq_ignore_ascii_case(id)))
         .ok_or_else(|| bad("effects.setDefaultTransition", format!("no effect `{id}`")))?;
     match def.kind {
         filmcraft_project::EffectKind::AudioTransition => s.state.default_audio_transition = def.id.to_string(),

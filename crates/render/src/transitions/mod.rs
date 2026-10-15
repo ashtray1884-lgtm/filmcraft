@@ -57,6 +57,10 @@ pub fn apply_scaled(e: &EffectInstance, a: &Image, b: &Image, p: f32, scale: f32
     if p >= 1.0 {
         return b.clone();
     }
+    if filmcraft_project::is_plugin_effect(&e.effect) {
+        // a missing or failing plug-in transition cuts at the midpoint rather than inventing a look
+        return crate::external::apply_transition(e, a, b, p, scale).unwrap_or_else(|| if p < 0.5 { a.clone() } else { b.clone() });
+    }
     if let Some(img) = legacy::apply(e, a, b, p) {
         return img;
     }

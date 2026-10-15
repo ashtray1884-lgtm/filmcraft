@@ -1,7 +1,7 @@
 name: Windows test build (Blackmagic RAW)
 
 # Builds a portable, unsigned Windows x64 FilmCraft with Blackmagic RAW support for hands-on
-# testing: filmcraft.exe, filmcraft-cli.exe and "Check Blackmagic RAW.bat", uploaded as the
+# testing: filmcraft.exe, filmcraft-cli.exe, "Check Blackmagic RAW.bat" and "Check Plug-ins.bat", uploaded as the
 # artifact "FilmCraft-BRAW-windows-x64". Runs the Blackmagic RAW tests on Windows first.
 
 on:
@@ -37,8 +37,27 @@ jobs:
         with:
           key: braw-windows-x64
 
-      - name: Blackmagic RAW tests
-        run: cargo test --release --locked -p filmcraft-platform -- braw
+      - name: Build OpenFX example plug-ins (test fixtures, BSD-3-Clause; not shipped)
+        shell: pwsh
+        run: |
+          git clone --quiet https://github.com/AcademySoftwareFoundation/openfx.git ofx-src
+          git -C ofx-src checkout --quiet adb790bf0043714cae6091d58791e8cdabdd9e12
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          New-Item -ItemType Directory -Force -Path ofx-test | Out-Null
+          $lib = (Get-ChildItem ofx-src\Support\Library\*.cpp | ForEach-Object { '"' + $_.FullName + '"' }) -join ' '
+          foreach ($p in 'Invert','Basic','Transition','Tester','ChoiceParams','Field') {
+            $src = (Get-ChildItem "ofx-src\Support\Plugins\$p\*.cpp" | ForEach-Object { '"' + $_.FullName + '"' }) -join ' '
+            cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && cl /nologo /LD /O1 /EHsc /std:c++17 /w /Iofx-src\include /Iofx-src\Support\include /Iofx-src\Support\Plugins\include $lib $src /Feofx-test\S$p.ofx /link opengl32.lib >nul"
+            if (!(Test-Path "ofx-test\S$p.ofx")) { Write-Error "building $p failed"; exit 1 }
+          }
+          Get-ChildItem ofx-test\*.ofx
+
+      - name: Blackmagic RAW and OpenFX tests
+        shell: pwsh
+        run: |
+          $env:FILMCRAFT_OFX_TEST_PLUGINS = (Resolve-Path ofx-test).Path
+          cargo test --release --locked -p filmcraft-platform -- braw ofx --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Clippy (platform crate)
         continue-on-error: true
@@ -57,6 +76,15 @@ jobs:
           $cli = 'target\x86_64-pc-windows-msvc\release\filmcraft-cli.exe'
           & $cli --version
           & $cli braw-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # OpenFX: the example plug-ins scanned in child processes, as on a user's machine
+          $env:OFX_PLUGIN_PATH = (Resolve-Path ofx-test).Path + '\bundles'
+          foreach ($f in Get-ChildItem ofx-test\*.ofx) {
+            $d = "ofx-test\bundles\$($f.Name).bundle\Contents\Win64"
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            Copy-Item $f.FullName $d
+          }
+          & $cli plugins
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Assemble the test folder

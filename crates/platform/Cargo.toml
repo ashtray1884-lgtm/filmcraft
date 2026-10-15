@@ -31,9 +31,17 @@ filmcraft-hevc = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-time = { workspace = true }
+filmcraft-geom = { workspace = true }
+filmcraft-project = { workspace = true }
+filmcraft-render = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+
+# OpenFX plug-ins are loaded at run time with libloading (ISC; already in the lockfile).
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+libloading = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = "0.3.2"
@@ -61,8 +69,6 @@ windows = { version = "0.62", features = [
 
 # Linux: libva (VA-API) is loaded at run time with libloading (ISC; already in the lockfile through
 # wgpu), so building needs no libva headers and a system without libva simply decodes in software.
-[target.'cfg(target_os = "linux")'.dependencies]
-libloading = "0.8"
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }

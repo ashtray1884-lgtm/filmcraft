@@ -857,14 +857,53 @@ pub fn effect_defs() -> &'static [EffectDef] {
     DEFS.get_or_init(build_effects)
 }
 
+/// Effects and transitions from installed plug-ins (OpenFX), registered at run time once the
+/// plug-in scan finishes: ids start with `ofx:` (effects) or `ofxt:` (transitions).
+static PLUGIN_DEFS: std::sync::RwLock<Vec<&'static EffectDef>> = std::sync::RwLock::new(Vec::new());
+
+/// Add plug-in effects (definitions live for the rest of the run; an id already registered is
+/// kept as it was, so effects in use never change under a running render).
+pub fn register_plugin_effects(defs: Vec<EffectDef>) {
+    let mut list = PLUGIN_DEFS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for d in defs {
+        if effect_defs().iter().any(|e| e.id == d.id) || list.iter().any(|e| e.id == d.id) {
+            continue;
+        }
+        list.push(Box::leak(Box::new(d)));
+    }
+}
+
+/// The plug-in effects registered so far.
+pub fn plugin_effect_defs() -> Vec<&'static EffectDef> {
+    PLUGIN_DEFS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Built-in effects followed by plug-in ones (the Effects panel, search, lookups).
+pub fn all_effect_defs() -> Vec<&'static EffectDef> {
+    let mut v: Vec<&'static EffectDef> = effect_defs().iter().collect();
+    v.extend(plugin_effect_defs());
+    v
+}
+
+/// Whether `id` names a plug-in effect or transition (rendered by the plug-in host).
+pub fn is_plugin_effect(id: &str) -> bool {
+    id.starts_with("ofx:") || id.starts_with("ofxt:")
+}
+
 pub fn find_effect(id: &str) -> Option<&'static EffectDef> {
+    if is_plugin_effect(id) {
+        return PLUGIN_DEFS.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().copied().find(|e| e.id == id);
+    }
     effect_defs().iter().find(|e| e.id == id)
 }
 
 /// Case-insensitive lookup by id or display name.
 pub fn find_effect_by_name(name: &str) -> Option<&'static EffectDef> {
     let n = name.to_ascii_lowercase();
-    effect_defs().iter().find(|e| e.id == n || e.name.to_ascii_lowercase() == n)
+    effect_defs()
+        .iter()
+        .find(|e| e.id == n || e.name.to_ascii_lowercase() == n)
+        .or_else(|| plugin_effect_defs().into_iter().find(|e| e.id.eq_ignore_ascii_case(&n) || e.name.to_ascii_lowercase() == n))
 }
 
 /// Intrinsic video effects every video track item carries (Motion, Opacity, Time Remapping).

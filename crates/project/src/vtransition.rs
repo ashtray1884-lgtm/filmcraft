@@ -386,7 +386,7 @@ pub(crate) fn video_transition_defs() -> Vec<EffectDef> {
 /// "Mosaic" or "Mirror" also name video effects, so plain name lookup is ambiguous).
 pub fn find_transition(name: &str, kind: EffectKind) -> Option<&'static EffectDef> {
     let n = name.trim().to_ascii_lowercase();
-    crate::effect::effect_defs().iter().filter(|d| d.kind == kind).find(|d| d.id == n || d.name.to_ascii_lowercase() == n)
+    crate::effect::all_effect_defs().into_iter().filter(|d| d.kind == kind).find(|d| d.id == n || d.name.to_ascii_lowercase() == n)
 }
 
 /// The Effects panel folder tree for video transitions: `(folder path, transition ids)` in panel

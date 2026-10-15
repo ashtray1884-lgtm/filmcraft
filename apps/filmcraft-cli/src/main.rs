@@ -88,6 +88,7 @@ SUBCOMMANDS
                                 instead
   export --list-presets [query] list export presets (name, category, format) as JSON
   render --seconds S --out f.png [--scale 0.5]   render one Program frame to PNG
+  plugins                       OpenFX plug-ins: scan the plug-in folders now and list what FilmCraft can use
   braw-check [clip.braw]        Blackmagic RAW: report what the installed runtime offers; with a clip,
                                 open it, time a frame decode and save it as <clip>.filmcraft-check.png
   probe <media> [--image-sequence]
@@ -255,6 +256,9 @@ async fn main() {
 }
 
 async fn cli() {
+    if filmcraft_platform::plugin_scan_main() {
+        return;
+    }
     let a = Args::parse(std::env::args().skip(1));
     // `--help` anywhere (`filmcraft-cli --help`, `filmcraft-cli export --help`) prints the reference:
     // the parser takes it as a flag option, so it never reaches the subcommand match.
@@ -269,6 +273,7 @@ async fn cli() {
     }
     register_hardware_decoders();
     register_gpu_frame_renderer();
+    filmcraft_platform::start_plugins(filmcraft_engine::autosave::default_data_dir());
     let Some(cmd) = a.pos(0) else { usage("missing subcommand") };
     match cmd {
         "help" | "-h" => out!("{HELP}"),
@@ -280,6 +285,7 @@ async fn cli() {
                 Err(e) => fail(e),
             }
         }
+        "plugins" => outln!("{}", filmcraft_platform::plugin_report(filmcraft_engine::autosave::default_data_dir())),
         "braw-check" => match braw_check(a.pos(1)) {
             Ok(report) => outln!("{report}"),
             Err(e) => fail(e),

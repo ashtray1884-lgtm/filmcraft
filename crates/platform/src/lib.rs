@@ -45,6 +45,10 @@ pub mod media_foundation;
 pub mod nvdec;
 #[cfg(any(target_os = "windows", all(target_os = "linux", target_pointer_width = "64")))]
 pub mod nvenc;
+/// OpenFX plug-in hosting (video effects and transitions); Windows and Linux on x86-64.
+#[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+pub mod ofx;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod vaapi;
 #[cfg(target_os = "macos")]
@@ -69,6 +73,42 @@ fn register_braw() {
     braw::set_runtime(std::sync::Arc::new(braw::windows::WinRuntime::default()));
     #[cfg(not(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     braw::set_missing(braw::Missing::Platform);
+}
+
+/// The plug-in scan child process (`<exe> --ofx-scan <binary>`): when the arguments ask for it,
+/// describe the plug-in, print the result and return `true` (the caller exits at once). Call first
+/// thing in `main`.
+pub fn plugin_scan_main() -> bool {
+    #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
+    {
+        ofx::scan_main()
+    }
+    #[cfg(not(all(any(windows, target_os = "linux"), target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// Start OpenFX plug-in support (effects and transitions from installed plug-ins); the cache of
+/// scanned plug-ins lives in `data_dir`. A no-op where plug-ins are not hosted.
+pub fn start_plugins(data_dir: Option<std::path::PathBuf>) {
+    #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
+    ofx::start(data_dir);
+    #[cfg(not(all(any(windows, target_os = "linux"), target_arch = "x86_64")))]
+    let _ = data_dir;
+}
+
+/// Scan for OpenFX plug-ins now and report what is installed (`filmcraft-cli plugins`).
+pub fn plugin_report(data_dir: Option<std::path::PathBuf>) -> String {
+    #[cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))]
+    {
+        ofx::scan_and_report(data_dir)
+    }
+    #[cfg(not(all(any(windows, target_os = "linux"), target_arch = "x86_64")))]
+    {
+        let _ = data_dir;
+        "OpenFX plug-ins are hosted on Windows and Linux (x86-64) only in this build".into()
+    }
 }
 
 /// What [`register`] made available.

@@ -2133,6 +2133,7 @@ dependencies = [
  "filmcraft-engine",
  "filmcraft-export",
  "filmcraft-frame",
+ "filmcraft-geom",
  "filmcraft-h264",
  "filmcraft-hevc",
  "filmcraft-isobmff",
@@ -2148,6 +2149,7 @@ dependencies = [
  "objc2-core-video",
  "objc2-video-toolbox",
  "rayon",
+ "serde",
  "serde_json",
  "windows 0.62.2",
 ]
