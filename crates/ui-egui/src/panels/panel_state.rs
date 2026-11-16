@@ -1,4 +1,4 @@
-//! Frontend state of the Lumetri Scopes, Timecode, Events, Progress and Reference Monitor panels
+//! Frontend state of the Video Scopes, Timecode, Events, Progress and Reference Monitor panels
 //! (`UiState::panels`). Plain serde, so agents read it with `ui.inspect` (`ui.panels`) and change
 //! it with `ui.set {"panels": {"scopes": {...}, "timecode": {...}, ...}}` (fields merged).
 
@@ -14,9 +14,21 @@ pub struct PanelsState {
     pub reference: ReferenceState,
     pub events: EventsState,
     pub progress: ProgressState,
+    /// Preferred selection for Metadata and Info; inspector focus does not replace it.
+    pub inspector_source: InspectorSource,
 }
 
-/// Lumetri Scopes settings (the wrench / right-click menu and the footer).
+/// The last selection panel used by the item inspectors. Only the source is retained, so
+/// project changes, deletion and deselection always resolve against the current selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InspectorSource {
+    #[default]
+    Project,
+    Timeline,
+}
+
+/// Video Scopes settings (the wrench / right-click menu and the footer).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ScopesState {
@@ -178,7 +190,7 @@ impl Default for TimecodeState {
 pub enum RefDisplay {
     #[default]
     Composite,
-    /// Lumetri Scopes of the reference frame (the panel's scope selection).
+    /// Video Scopes of the reference frame (the panel's scope selection).
     Scopes,
 }
 

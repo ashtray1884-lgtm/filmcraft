@@ -358,6 +358,7 @@ impl BrawSource {
                 },
                 pixel_format: "RAW (decoded to RGB 16-bit)".into(),
                 color: FRAME_COLOR,
+                color_assumed: None,
                 has_alpha: false,
                 bitrate,
                 hdr: None,

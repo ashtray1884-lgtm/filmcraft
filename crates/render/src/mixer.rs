@@ -63,6 +63,12 @@ pub const PARAM_BLOCK: i64 = 64;
 /// Longest pre-roll for a fresh graph (seconds).
 const MAX_PREROLL_S: f64 = 3.0;
 
+/// Most latency (seconds) the inserts of one graph may add up to, and most samples its route
+/// compensation delays may hold together. Real graphs are milliseconds; a project can chain
+/// thousands of latency-bearing inserts, each with its own delay ring and warm-up window.
+const MAX_GRAPH_LATENCY_S: usize = 10;
+const MAX_COMPENSATION_SAMPLES: usize = 1 << 25;
+
 // ------------------------------------------------------------------------------------- live state
 
 /// A control held (or just released) on the mixer while playing.
@@ -543,7 +549,8 @@ struct GraphState {
     latency: usize,
 }
 
-fn build_state(plan: &Plan, sr: u32) -> GraphState {
+/// The graph's state, or None when its latency or compensation delays are past the limits above.
+fn build_state(plan: &Plan, sr: u32) -> Option<GraphState> {
     let mk = |v: &[Insert], w: usize| -> Vec<Box<dyn AudioEffect>> {
         // a missing plug-in passes the sound through, keeping every insert in its slot
         v.iter().map(|i| crate::audio_fx::create(&i.map, &i.effect, sr, w).unwrap_or_else(|| Box::new(crate::audio_fx::Passthrough))).collect()
@@ -561,17 +568,30 @@ fn build_state(plan: &Plan, sr: u32) -> GraphState {
         .collect();
     let tap_lat = |s: &StripState, tap: Tap| s.in_lat + if tap == Tap::Pre { s.lat_pre } else { s.lat_pre + s.lat_post };
     // strips are in topological order (routes only go forward)
+    let max_latency = (sr as usize).saturating_mul(MAX_GRAPH_LATENCY_S);
     for i in 0..strips.len() {
         let in_lat = plan.routes.iter().filter(|r| r.target == i).map(|r| tap_lat(&strips[r.src], r.tap)).max().unwrap_or(0);
         strips[i].in_lat = in_lat;
+        if in_lat.saturating_add(strips[i].lat_pre).saturating_add(strips[i].lat_post) > max_latency {
+            return None;
+        }
+    }
+    // the whole compensation is checked before any ring is allocated, so a refused graph costs nothing
+    let delay_of = |strips: &[StripState], r: &RouteSpec| strips[r.target].in_lat - tap_lat(&strips[r.src], r.tap);
+    let mut compensation = 0usize;
+    for r in &plan.routes {
+        compensation = compensation.saturating_add(delay_of(&strips, r).saturating_mul(plan.strips[r.target].width));
+        if compensation > MAX_COMPENSATION_SAMPLES {
+            return None;
+        }
     }
     for r in &plan.routes {
-        let d = strips[r.target].in_lat - tap_lat(&strips[r.src], r.tap);
+        let d = delay_of(&strips, r);
         strips[r.src].delays.push(DelayLine::new(d, plan.strips[r.target].width));
     }
     let m = strips.len() - 1;
     let latency = strips[m].in_lat + strips[m].lat_pre + strips[m].lat_post;
-    GraphState { next_out: 0, strips, latency }
+    Some(GraphState { next_out: 0, strips, latency })
 }
 
 fn cache() -> &'static Mutex<HashMap<u64, Vec<GraphState>>> {
@@ -579,11 +599,17 @@ fn cache() -> &'static Mutex<HashMap<u64, Vec<GraphState>>> {
     C.get_or_init(Default::default)
 }
 
+/// Keys of graphs [`build_state`] refused (same key and sample rate: same refusal).
+fn refused_graphs() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static R: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
 /// Total latency (samples) of the sequence's mixer graph: how far ahead of the timeline the graph
 /// is read so its output lines up.
 pub fn graph_latency(seq: &Sequence) -> usize {
     let plan = Plan::build(seq, &HashMap::new());
-    build_state(&plan, seq.settings.sample_rate).latency
+    build_state(&plan, seq.settings.sample_rate).map_or(0, |st| st.latency)
 }
 
 // ------------------------------------------------------------------------------------- processing
@@ -636,14 +662,24 @@ fn run_inserts(chain: &mut [Box<dyn AudioEffect>], ins: &[Insert], buf: &mut Bus
         return;
     }
     let n = buf[0].len();
+    // Reapply constant settings once per request (so live edits are picked up), not at every
+    // 64-sample boundary. Animated inserts keep the absolute-grid evaluation below.
+    let refresh: Vec<bool> = ins
+        .iter()
+        .map(|e| {
+            !matches!(e.effect.effect.as_str(), "parametric_eq" | "dynamics" | "studio_reverb") || e.effect.params.values().any(|p| !p.keyframes.is_empty())
+        })
+        .collect();
     let mut i = 0usize;
     while i < n {
         let pos = x0 + i as i64;
         let end = (((pos.div_euclid(PARAM_BLOCK) + 1) * PARAM_BLOCK - x0) as usize).min(n);
         // parameters of the whole grid block (also when a request starts mid-block)
         let t = Tick::from_units(pos.div_euclid(PARAM_BLOCK) * PARAM_BLOCK - lat as i64, sr as i64);
-        for (d, e) in chain.iter_mut().zip(ins) {
-            (e.map.apply)(d.as_mut(), &e.effect, t);
+        for ((d, e), refresh) in chain.iter_mut().zip(ins).zip(&refresh) {
+            if i == 0 || *refresh {
+                (e.map.apply)(d.as_mut(), &e.effect, t);
+            }
         }
         let mut ch: Vec<&mut [f32]> = buf.iter_mut().map(|c| &mut c[i..end]).collect();
         for d in chain.iter_mut() {
@@ -728,8 +764,16 @@ fn pan51(buf: &Bus, layout: Layout, tr: &Track, id: TrackId, ovs: &HashMap<(Trac
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, x0: i64, skip: usize, sr: u32, ovs: &HashMap<(TrackId, String), Override>) -> StripOut {
+/// Where in time a strip is run: first sample, samples to skip, sample rate and live overrides.
+struct StripRun<'a> {
+    x0: i64,
+    skip: usize,
+    sr: u32,
+    ovs: &'a HashMap<(TrackId, String), Override>,
+}
+
+fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, run: StripRun<'_>) -> StripOut {
+    let StripRun { x0, skip, sr, ovs } = run;
     let s = &plan.strips[si];
     let tr: &Track = &s.track;
     let id = tr.id;
@@ -845,7 +889,9 @@ pub(crate) fn mix_graph_at(
     live: Option<&LiveMix>,
     depth: u32,
 ) -> AudioBuffer {
-    let sr = seq.settings.sample_rate.max(1);
+    // the same bounded clock `audio::nested_mix` sizes its requests with: a damaged rate (1 Hz)
+    // would otherwise multiply every nested request by the clamp at each level
+    let sr = crate::audio::bounded_sample_rate(seq.settings.sample_rate);
     let ovs = live.filter(|l| l.is_active()).map(LiveMix::overrides).unwrap_or_default();
     let plan = Plan::build(seq, &ovs);
     let key = plan.structure_hash(sr);
@@ -856,7 +902,20 @@ pub(crate) fn mix_graph_at(
     let (mut st, skip) = match taken {
         Some(st) => (st, 0usize),
         None => {
-            let st = build_state(&plan, sr);
+            // refused: silence in the Mix's own width (6 channels for a 5.1 Mix)
+            let refused = || AudioBuffer::silence(sr, plan.strips.last().map_or(2, |s| s.width), frames);
+            // a refused graph is remembered by its key, so every block does not rebuild all its DSP states to refuse it again
+            if lock(refused_graphs()).contains(&key) {
+                return refused();
+            }
+            let Some(st) = build_state(&plan, sr) else {
+                let mut r = lock(refused_graphs());
+                if r.len() >= 64 {
+                    r.clear();
+                }
+                r.insert(key);
+                return refused();
+            };
             let pre = plan.preroll(Tick::from_units(start, sr as i64), sr).max(st.latency);
             (st, pre)
         }
@@ -885,13 +944,13 @@ pub(crate) fn mix_graph_at(
                 return None;
             }
             let input = if has_clips {
-                let mut v = track_input_at(project, &s.track, x0, total, sr, sources, &ovs, depth).channels;
+                let mut v = track_input_at(project, &s.track, crate::audio::Window { start: x0, frames: total, sr }, sources, &ovs, depth).channels;
                 v.resize(s.width, vec![0.0; total]);
                 v
             } else {
                 silent(s.width, total)
             };
-            Some(run_strip(&plan, si, ss, input, x0, skip, sr, &ovs))
+            Some(run_strip(&plan, si, ss, input, StripRun { x0, skip, sr, ovs: &ovs }))
         })
         .collect();
     let deliver = |o: StripOut, si: usize, bus: &mut Vec<Option<Bus>>, meters: &mut Vec<(TrackId, Vec<f32>)>| {
@@ -922,7 +981,7 @@ pub(crate) fn mix_graph_at(
             continue;
         }
         let input = bus[si].take().unwrap_or_else(|| silent(s.width, total));
-        let o = run_strip(&plan, si, ss, input, x0, skip, sr, &ovs);
+        let o = run_strip(&plan, si, ss, input, StripRun { x0, skip, sr, ovs: &ovs });
         if let Some(fin) = deliver(o, si, &mut bus, &mut meters) {
             out = fin;
         }

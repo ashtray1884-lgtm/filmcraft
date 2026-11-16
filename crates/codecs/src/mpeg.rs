@@ -1,35 +1,27 @@
 //! MPEG-2 transport streams (`.ts`, `.m2ts`, `.mts`), program streams (`.mpg`, `.vob`, `.mod`)
 //! and MPEG-1/2 video elementary streams (`.m2v`, `.m1v`).
 //!
-//! - Demux and the access-unit index come from `filmcraft-mpegts` (built when the file opens).
+//! - Demux and the access-unit index come from `craft_media::mpegts` (built when the file opens).
 //! - Video: MPEG-1/2 (our decoder), H.264 and HEVC (Annex B byte streams, our decoders) with
 //!   GOP-aware random access ([`crate::gop`]). Frames are presented in display order, from the
 //!   first random-access picture; display order comes from the PTS (or, without timestamps, the
 //!   GOP and temporal reference). Leading pictures of an open GOP decode from the previous GOP.
 //! - Audio: MPEG audio layers I-III (symphonia), AAC in ADTS or LATM (our decoder), AC-3 (our
-//!   decoder), Blu-ray / AVCHD and DVD LPCM. Audio frames are placed on the timeline from their
-//!   PTS relative to the first video frame, sample-contiguously (re-anchored only at gaps).
+//!   decoder), Blu-ray / AVCHD and DVD LPCM. Every audio PID is a stream (capped). Audio frames
+//!   are placed on the timeline from their PTS relative to the first video frame,
+//!   sample-contiguously (re-anchored only at gaps).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use craft_media::mpegts::{Codec, File, Kind, Unit};
 use filmcraft_frame::{AudioBuffer, VideoFrame};
 use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
-use filmcraft_mpegts::{Codec, File, Kind, Unit};
 use filmcraft_time::{FrameRate, Tick};
 
 use crate::CodecError;
 use crate::gop::{GopCache, VideoSamples};
 use crate::video::{H264Decoder, HevcDecoder, Mpeg2Decoder, VideoDecoder};
-
-impl filmcraft_mpegts::ByteSource for crate::Src {
-    fn len(&self) -> u64 {
-        self.0.len()
-    }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.0.read_at(offset, buf)
-    }
-}
 
 /// An MPEG-1/2 video elementary stream starts with a sequence header.
 fn is_video_es(head: &[u8]) -> bool {
@@ -37,7 +29,7 @@ fn is_video_es(head: &[u8]) -> bool {
 }
 
 pub fn sniff(head: &[u8]) -> bool {
-    filmcraft_mpegts::sniff(head).is_some() || is_video_es(head)
+    craft_media::mpegts::sniff(head).is_some() || is_video_es(head)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +62,7 @@ enum ACodec {
     Latm,
     Ac3,
     LpcmBluray,
-    LpcmDvd(filmcraft_mpegts::LpcmFormat),
+    LpcmDvd(craft_media::mpegts::LpcmFormat),
 }
 
 struct AudioState {
@@ -104,7 +96,8 @@ pub struct MpegSource {
     es: Option<(Arc<[u8]>, Vec<std::ops::Range<usize>>)>,
     video: Option<VideoTrack>,
     gop: GopCache,
-    audio: Option<AudioTrack>,
+    /// Playable audio tracks in file order: `info.audio_streams[k]` describes `audios[k]`.
+    audios: Vec<AudioTrack>,
     /// Why the video or audio stream cannot be decoded.
     unsupported_video: Option<String>,
     unsupported_audio: Option<String>,
@@ -193,16 +186,16 @@ impl MpegSource {
         if is_video_es(&head) {
             return Self::open_es(name, bytes);
         }
-        let file = filmcraft_mpegts::open(&bytes).map_err(|e| match e {
-            filmcraft_mpegts::Error::NotMpeg => CodecError::Unsupported("not an MPEG stream".into()),
+        let file = craft_media::mpegts::open(&bytes).map_err(|e| match e {
+            craft_media::mpegts::Error::NotMpeg => CodecError::Unsupported("not an MPEG stream".into()),
             other => CodecError::Container(other.to_string()),
         })?;
         for w in &file.warnings {
             log::warn!("{name}: {w}");
         }
         let vstream = file.find(Kind::Video, |c| vkind(c).is_some()).or_else(|| file.find(Kind::Video, |_| true));
-        let astream = file.find(Kind::Audio, audio_supported).or_else(|| file.find(Kind::Audio, |_| true));
-        if vstream.is_none() && astream.is_none() {
+        let has_audio = file.streams.iter().any(|s| s.kind() == Kind::Audio && !s.units.is_empty());
+        if vstream.is_none() && !has_audio {
             return Err(CodecError::Unsupported(format!("{}: no video or audio streams", file.format.name())));
         }
         let mut src = MpegSource {
@@ -221,7 +214,7 @@ impl MpegSource {
             es: None,
             video: None,
             gop: GopCache::new(None),
-            audio: None,
+            audios: Vec::new(),
             unsupported_video: None,
             unsupported_audio: None,
         };
@@ -256,7 +249,7 @@ impl MpegSource {
                     src.video = Some(track);
                     src.describe_video(rate_from_pts)?;
                     if let Some(file) = src.file.take() {
-                        src.setup_audio(file, astream, origin);
+                        src.setup_audio(file, origin);
                     }
                 }
                 None => {
@@ -272,13 +265,14 @@ impl MpegSource {
                         has_alpha: false,
                         bitrate: None,
                         hdr: None,
+                        color_assumed: None,
                     });
-                    src.setup_audio(file, astream, None);
+                    src.setup_audio(file, None);
                 }
             }
         } else {
             src.info.kind = MediaKind::AudioOnly;
-            src.setup_audio(file, astream, None);
+            src.setup_audio(file, None);
         }
         Ok(src)
     }
@@ -288,8 +282,8 @@ impl MpegSource {
         let all: Arc<[u8]> = filmcraft_media::reader::read_range(&*bytes.0, 0, usize::try_from(bytes.0.len()).unwrap_or(usize::MAX))
             .map_err(|e| CodecError::Container(e.to_string()))?
             .into();
-        let aus = filmcraft_mpeg2v::access_units(&all);
-        let infos: Vec<filmcraft_mpeg2v::AccessUnitInfo> = aus.iter().map(|r| filmcraft_mpeg2v::scan_access_unit(&all[r.clone()])).collect();
+        let aus = craft_video::mpeg2::access_units(&all);
+        let infos: Vec<craft_video::mpeg2::AccessUnitInfo> = aus.iter().map(|r| craft_video::mpeg2::scan_access_unit(&all[r.clone()])).collect();
         let first_key = infos.iter().position(|a| a.is_intra()).ok_or_else(|| CodecError::Decode("no I picture in the stream".into()))?;
         // fake units carrying the picture info for display ordering
         let mut keys = Vec::new();
@@ -326,7 +320,7 @@ impl MpegSource {
             es: Some((all, aus)),
             video: Some(track),
             gop: GopCache::new(None),
-            audio: None,
+            audios: Vec::new(),
             unsupported_video: None,
             unsupported_audio: None,
         };
@@ -347,15 +341,15 @@ impl MpegSource {
     /// Timeline position (samples at the audio stream's rate) of the first audio frame, and the
     /// number of samples in the audio stream.
     pub fn audio_extent(&self) -> Option<(i64, i64)> {
-        let a = self.audio.as_ref()?;
+        let a = self.audios.first()?;
         let first = *a.starts.first()?;
         let end = a.starts.last()? + *a.lens.last()? as i64;
         Some((first, end - first))
     }
 
-    /// The demuxed stream indices of the presented video and audio.
+    /// The demuxed stream indices of the presented video and first audio.
     pub fn stream_indices(&self) -> (Option<usize>, Option<usize>) {
-        (self.video.as_ref().filter(|_| self.es.is_none()).map(|v| v.stream), self.audio.as_ref().map(|a| a.stream))
+        (self.video.as_ref().filter(|_| self.es.is_none()).map(|v| v.stream), self.audios.first().map(|a| a.stream))
     }
 
     /// Presentation timestamps (90 kHz) of the presented video frames in display order. Frames
@@ -367,15 +361,7 @@ impl MpegSource {
         let raw: Vec<Option<i64>> = v.order.iter().map(|&i| units[v.units[i]].pts).collect();
         let rate = self.info.frame_rate();
         let dur = |k: i64| (k as i128 * 90_000 * rate.den as i128 / rate.num.max(1) as i128) as i64;
-        let known: Vec<usize> = (0..raw.len()).filter(|&i| raw[i].is_some()).collect();
-        (0..raw.len())
-            .map(|i| {
-                raw[i].or_else(|| {
-                    let j = known.iter().rev().find(|&&j| j < i).or_else(|| known.iter().find(|&&j| j > i))?;
-                    Some(raw[*j]? + dur(i as i64 - *j as i64))
-                })
-            })
-            .collect()
+        interpolate_pts(&raw, dur)
     }
 
     fn read_unit(&self, v: &VideoTrack, i: usize) -> crate::Result<Vec<u8>> {
@@ -398,10 +384,11 @@ impl MpegSource {
         color = filmcraft_color::ColorInfo::REC709;
         match v.kind {
             VKind::Mpeg2 => {
-                let info = filmcraft_mpeg2v::probe(&first).ok_or_else(|| CodecError::Decode("no MPEG video sequence header at the first I picture".into()))?;
+                let info =
+                    craft_video::mpeg2::probe(&first).ok_or_else(|| CodecError::Decode("no MPEG video sequence header at the first I picture".into()))?;
                 let header = crate::video::mpeg2_sequence_header(&first).unwrap_or_default();
                 // field order from the first frames' picture coding extensions
-                let mut d = filmcraft_mpeg2v::Decoder::new();
+                let mut d = craft_video::mpeg2::Decoder::new();
                 let mut fo = None;
                 for i in 0..v.units.len().min(4) {
                     if let Ok(pics) = d.decode(&self.read_unit(v, i)?, i as i64)
@@ -471,19 +458,36 @@ impl MpegSource {
             has_alpha: false,
             bitrate: (secs > 0.0).then(|| (total_bytes as f64 * 8.0 / secs) as u64),
             hdr: None,
+            color_assumed: None,
         });
         Ok(())
     }
 
-    /// Choose and index the audio stream; `origin`: PTS of the first video frame.
-    fn setup_audio(&mut self, file: File, astream: Option<usize>, origin: Option<i64>) {
-        let track = astream.and_then(|ai| self.audio_track(&file, ai, origin));
+    /// Index every audio stream the container carries (capped); `origin`: PTS of the first video frame.
+    fn setup_audio(&mut self, file: File, origin: Option<i64>) {
+        let indices: Vec<usize> = file
+            .streams
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind() == Kind::Audio && !s.units.is_empty())
+            .map(|(i, _)| i)
+            .take(filmcraft_media::MAX_AUDIO_STREAMS)
+            .collect();
+        let mut tracks = Vec::new();
+        for ai in indices {
+            if let Some(t) = self.audio_track(&file, ai, origin) {
+                tracks.push(t);
+            }
+        }
         self.file = Some(file);
-        self.audio = track;
+        self.audios = tracks;
     }
 
-    /// Mark the audio stream as not decodable (it still shows in the media info).
+    /// Mark the audio stream as not decodable (it still shows in the media info when nothing plays).
     fn audio_unsupported(&mut self, codec_name: &str, why: String) -> Option<AudioTrack> {
+        if !self.info.audio_streams.is_empty() {
+            return None;
+        }
         self.unsupported_audio = Some(why);
         self.info.audio_streams =
             vec![AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: format!("{codec_name} (unsupported)"), bits_per_sample: None }];
@@ -506,7 +510,7 @@ impl MpegSource {
         let mut latm = None;
         let (codec, rate, channels, per_frame, bits) = match &st.codec {
             Codec::MpegAudio | Codec::AacAdts | Codec::Ac3 | Codec::Eac3 => {
-                let Some(fi) = filmcraft_mpegts::frame_info(&st.codec, &first) else {
+                let Some(fi) = craft_media::mpegts::frame_info(&st.codec, &first) else {
                     return self.audio_unsupported(&codec_name, format!("{codec_name}: bad frame header"));
                 };
                 let c = match st.codec {
@@ -552,7 +556,7 @@ impl MpegSource {
             }
             byte_starts.push(acc);
         }
-        let group = |f: filmcraft_mpegts::LpcmFormat| crate::audio::dvd_lpcm_group_bytes(f.channels as usize, f.bits) as u64;
+        let group = |f: craft_media::mpegts::LpcmFormat| crate::audio::dvd_lpcm_group_bytes(f.channels as usize, f.bits) as u64;
         // samples per unit
         let lens: Vec<u32> = st
             .units
@@ -594,14 +598,16 @@ impl MpegSource {
             next = Some(s + n as i64);
         }
         let total = next.unwrap_or(0).max(0);
-        if self.info.video.is_none() || self.unsupported_video.is_some() {
+        if self.unsupported_audio.take().is_some() {
+            self.info.audio_streams.clear();
+        }
+        if self.info.audio_streams.is_empty() && (self.info.video.is_none() || self.unsupported_video.is_some()) {
             self.info.duration = Tick::from_units(total, rate.max(1) as i64);
             if self.info.video.is_none() {
                 self.info.kind = MediaKind::AudioOnly;
             }
         }
-        self.info.audio_streams =
-            vec![AudioStreamInfo { sample_rate: rate.max(1), channels: channels.max(1) as u32, codec: codec_name, bits_per_sample: bits }];
+        self.info.audio_streams.push(AudioStreamInfo { sample_rate: rate.max(1), channels: channels.max(1) as u32, codec: codec_name, bits_per_sample: bits });
         Some(AudioTrack {
             stream: ai,
             codec,
@@ -668,6 +674,23 @@ impl MpegSource {
         }
         Ok(p)
     }
+}
+
+/// Fill missing timestamps from their closest preceding timestamp, or the next one when there is
+/// no predecessor.  The known positions are sorted, so binary search avoids rescanning them for
+/// every missing frame.
+fn interpolate_pts(raw: &[Option<i64>], dur: impl Fn(i64) -> i64) -> Vec<Option<i64>> {
+    let known: Vec<usize> = (0..raw.len()).filter(|&i| raw[i].is_some()).collect();
+    raw.iter()
+        .enumerate()
+        .map(|(i, &pts)| {
+            pts.or_else(|| {
+                let next = known.partition_point(|&j| j < i);
+                let j = next.checked_sub(1).or_else(|| known.get(next).map(|_| next))?;
+                Some(raw[known[j]]? + dur(i as i64 - known[j] as i64))
+            })
+        })
+        .collect()
 }
 
 fn chroma_name(c: filmcraft_frame::Chroma) -> &'static str {
@@ -740,10 +763,15 @@ impl VideoSamples for MpegVideo<'_> {
     }
     fn sync_before(&self, i: usize) -> usize {
         let i = i.min(self.v.keys.len().saturating_sub(1));
-        let key = (0..=i).rev().find(|&k| self.v.keys[k]).unwrap_or(0);
+        let keys = &self.v.keys;
+        let pts = &self.v.pts;
         // a leading picture of an open GOP (shown before its random-access picture) needs the
         // previous GOP's pictures as references
-        if key > 0 && self.v.pts[i] < self.v.pts[key] { self.sync_before(key - 1) } else { key }
+        crate::gop::open_gop_sync(
+            i,
+            |i| (0..=i).rev().find(|&k| keys.get(k) == Some(&true)).unwrap_or(0),
+            |i, key| matches!((pts.get(i), pts.get(key)), (Some(a), Some(b)) if a < b),
+        )
     }
     fn sample_at(&self, t: i64) -> Option<usize> {
         usize::try_from(t).ok().and_then(|t| self.v.order.get(t).copied())
@@ -783,10 +811,16 @@ impl MediaSource for MpegSource {
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
-        if let Some(why) = &self.unsupported_audio {
+        self.audio_stream(0, start, frames, sample_rate)
+    }
+
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
+        if self.audios.is_empty()
+            && let Some(why) = &self.unsupported_audio
+        {
             return Err(MediaError::Unsupported(why.clone()));
         }
-        let a = self.audio.as_ref().ok_or(MediaError::NoStream("audio"))?;
+        let a = self.audios.get(stream).ok_or(MediaError::NoStream("audio"))?;
         let ch = a.channels;
         let ratio = a.rate as f64 / sample_rate as f64;
         let exact = a.rate == sample_rate;
@@ -819,17 +853,7 @@ impl MediaSource for MpegSource {
             }
             return Ok(out);
         }
-        let frac = s0 as f64 - start as f64 * ratio;
-        for k in 0..frames {
-            let pos = k as f64 * ratio - frac;
-            let i0 = pos.floor().max(0.0) as usize;
-            let f = (pos - i0 as f64) as f32;
-            for c in 0..ch {
-                let x = src[c].get(i0).copied().unwrap_or(0.0);
-                let y = src[c].get(i0 + 1).copied().unwrap_or(x);
-                out.channels[c][k] = x + (y - x) * f;
-            }
-        }
+        filmcraft_media::resample_window_into(&src, s0, a.rate, start, sample_rate, &mut out.channels);
         Ok(out)
     }
 }
@@ -852,6 +876,7 @@ pub fn reader_opener(name: &str, head: &[u8], reader: &filmcraft_media::SharedRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filmcraft_media::MediaSource;
 
     /// A mutated transport stream whose PTS span gave ~0 fps panicked on open with "attempt to
     /// divide by zero" (`FrameRate::tick_of`).
@@ -868,6 +893,137 @@ mod tests {
         assert_eq!(stream_rate(None, Some(50.0)), FrameRate::from_f64(50.0));
     }
 
+    /// MPEG-1 layer II frame, 48 kHz 192 kb/s (576 bytes).
+    fn mp2_frame(k: u8) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xFD, 0xA4, 0x00];
+        v.extend((0..572).map(|i| (i as u8) ^ k));
+        v
+    }
+
+    fn ts_bytes(prefix: u8, v: i64) -> [u8; 5] {
+        let v = v & ((1 << 33) - 1);
+        [(prefix << 4) | (((v >> 30) & 7) as u8) << 1 | 1, (v >> 22) as u8, (((v >> 15) & 0x7F) as u8) << 1 | 1, (v >> 7) as u8, ((v & 0x7F) as u8) << 1 | 1]
+    }
+
+    fn pes(stream_id: u8, pts: Option<i64>, payload: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        if let Some(p) = pts {
+            h.extend(ts_bytes(2, p));
+        }
+        let flags = if pts.is_some() { 0x80 } else { 0 };
+        let len = 3 + h.len() + payload.len();
+        let mut v = vec![0, 0, 1, stream_id, (len >> 8) as u8, len as u8, 0x80, flags, h.len() as u8];
+        v.extend(h);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Tiny TS muxer: PAT, PMT and PES packets in 188-byte packets.
+    struct TsMux {
+        out: Vec<u8>,
+        cc: std::collections::HashMap<u16, u8>,
+    }
+
+    impl TsMux {
+        fn packet(&mut self, pid: u16, pusi: bool, payload: &[u8]) -> usize {
+            let cc = self.cc.entry(pid).or_insert(0);
+            let mut p = vec![0x47, (pusi as u8) << 6 | (pid >> 8) as u8, pid as u8];
+            let n = payload.len().min(184);
+            if n < 184 {
+                let al = 183 - n;
+                p.push(0x30 | *cc);
+                p.push(al as u8);
+                if al > 0 {
+                    p.push(0);
+                    p.extend(std::iter::repeat_n(0xFF, al - 1));
+                }
+            } else {
+                p.push(0x10 | *cc);
+            }
+            *cc = (*cc + 1) & 15;
+            p.extend_from_slice(&payload[..n]);
+            self.out.extend(&p);
+            n
+        }
+        fn section(&mut self, pid: u16, body: &[u8]) {
+            let mut s = body.to_vec();
+            s.extend(crc32_mpeg(&s).to_be_bytes());
+            let mut payload = vec![0];
+            payload.extend(s);
+            self.packet(pid, true, &payload);
+        }
+        fn psi(&mut self, streams: &[(u8, u16)]) {
+            let pat = [0x00, 0xB0, 13, 0, 1, 0xC1, 0, 0, 0, 1, 0xE1, 0x00];
+            self.section(0, &pat);
+            let mut pmt = vec![0x02, 0xB0, 0, 0, 1, 0xC1, 0, 0, 0xE1, 0x00, 0xF0, 0];
+            for &(st, pid) in streams {
+                pmt.extend([st, 0xE0 | (pid >> 8) as u8, pid as u8, 0xF0, 0]);
+            }
+            let len = pmt.len() - 3 + 4;
+            pmt[1] = 0xB0 | (len >> 8) as u8;
+            pmt[2] = len as u8;
+            self.section(0x100, &pmt);
+        }
+        fn pes(&mut self, pid: u16, data: &[u8]) {
+            let mut rest = data;
+            let mut first = true;
+            while !rest.is_empty() {
+                let n = self.packet(pid, first, rest);
+                rest = &rest[n..];
+                first = false;
+            }
+        }
+    }
+
+    fn crc32_mpeg(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= (b as u32) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04C1_1DB7 } else { crc << 1 };
+            }
+        }
+        crc
+    }
+
+    /// Dual MPEG audio in one transport stream: import used to keep only the first PID.
+    #[test]
+    fn every_audio_pid_is_a_stream() {
+        let mut mux = TsMux { out: Vec::new(), cc: Default::default() };
+        mux.psi(&[(0x03, 0x1100), (0x03, 0x1101)]);
+        for k in 0..4u16 {
+            mux.pes(0x1100, &pes(0xC0, Some(90_000 + 2160 * k as i64), &mp2_frame(k as u8)));
+            mux.pes(0x1101, &pes(0xC1, Some(90_000 + 2160 * k as i64), &mp2_frame(k as u8 + 16)));
+        }
+        let source = MpegSource::open("dual.ts", mux.out.into()).unwrap();
+        assert_eq!(source.info().audio_streams.len(), 2, "{:?}", source.info().audio_streams);
+        assert_eq!(source.info().audio_streams.iter().map(|a| a.sample_rate).collect::<Vec<_>>(), vec![48_000, 48_000]);
+        let a0 = source.audio(0, 64, 48_000).unwrap();
+        let a1 = source.audio_stream(1, 0, 64, 48_000).unwrap();
+        assert_eq!(a0.channels.len(), 2);
+        assert_eq!(a1.channels.len(), 2);
+        assert!(source.audio_stream(2, 0, 64, 48_000).is_err());
+    }
+
+    /// Resampled audio must not depend on where a read starts (#4673): 16-bit DVD LPCM at 48 kHz in
+    /// a program stream.
+    #[test]
+    fn resampled_audio_does_not_depend_on_the_read_cuts() {
+        let signs = filmcraft_testkit::cuts::signs(filmcraft_testkit::cuts::SOURCE_SAMPLES, 6);
+        let mut out = vec![0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3, 0xF8];
+        for (k, block) in signs.chunks(1000).enumerate() {
+            // sub-stream 0xA0: frame count, first access unit pointer, emphasis, 16-bit 48 kHz mono, dynamic range
+            let mut payload = vec![0xA0, 1, 0, 4, 0, 0, 0x80];
+            payload.extend(block.iter().flat_map(|v| ((v * 32767.0) as i16).to_be_bytes()));
+            out.extend(pes(0xBD, Some(90_000 + 1875 * k as i64), &payload));
+        }
+        let source = MpegSource::open("cuts.vob", out.into()).unwrap();
+        assert_eq!(source.info().audio().map(|a| (a.sample_rate, a.channels)), Some((48_000, 1)));
+        filmcraft_testkit::cuts::assert_cut_independent("DVD LPCM 48 kHz at 1999 Hz", 1_000, filmcraft_testkit::cuts::FRAMES, |s, n| {
+            source.audio(s, n, filmcraft_testkit::cuts::RATE).unwrap().channels
+        });
+    }
+
     #[test]
     fn presentation_drops_leading_pictures_and_orders_by_key() {
         // decode order I(2) B(0) B(1) P(5) B(3) B(4): the leading B pictures are not presented
@@ -875,5 +1031,17 @@ mod tests {
         let (pts, order) = presentation(&keys);
         assert_eq!(order, vec![0, 4, 5, 3]);
         assert_eq!(pts, vec![0, -2, -3, 3, 1, 2]);
+    }
+
+    #[test]
+    fn timestamp_interpolation_handles_long_missing_runs_without_rescanning() {
+        let mut raw = vec![None; 10_000];
+        raw[4_000] = Some(40_000);
+        raw[9_999] = Some(99_990);
+        let pts = interpolate_pts(&raw, |frames| frames * 10);
+        assert_eq!(pts[0], Some(0));
+        assert_eq!(pts[3_999], Some(39_990));
+        assert_eq!(pts[4_001], Some(40_010));
+        assert_eq!(pts[9_998], Some(99_980));
     }
 }

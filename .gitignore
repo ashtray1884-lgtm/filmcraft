@@ -1,8 +1,10 @@
 *~
 plan/
 /target
+/crates/*/target/
 /dist
 /log
 .DS_Store
 .claude/worktrees/
 ofxPluginLog.txt
+__pycache__/

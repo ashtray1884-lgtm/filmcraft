@@ -1,18 +1,38 @@
 //! cpal audio output: the playback master clock. Settings ▸ Audio Hardware picks the host
 //! ("Device Class"), the output device, the I/O buffer size and the sample rate.
+//!
+//! A stream the device drops while playing (an ALSA xrun the backend does not recover from, which
+//! cpal reports as `poll() returned POLLERR`; an unplugged device) is restarted by
+//! [`AudioOut::recover`], keeping the played-frame clock and the play-ahead mixer, so sound
+//! resumes where it stopped instead of playback going silent (#840).
+//!
+//! The scrub grain plays on [`CpalScrubOut`], a second output owned by its own thread, because
+//! opening a WASAPI stream can take 0.5-1 s and a playhead drag cannot wait for it (#2633).
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use filmcraft_engine::settings::AudioHardwarePrefs;
+use filmcraft_ui_egui::scrub::ScrubOut;
 use filmcraft_ui_egui::{AudioDevices, AudioOut};
+
+/// The playback mixer callback handed to [`AudioOut::start`].
+type Fill = Box<dyn FnMut(&mut [f32], usize) + Send>;
 
 pub struct CpalOut {
     stream: Option<cpal::Stream>,
+    /// The running playback's mixer, shared with the stream so a restarted stream continues it.
+    fill: Option<Arc<Mutex<Fill>>>,
     played: Arc<AtomicU64>,
-    failed: Arc<AtomicBool>,
+    health: Arc<Health>,
+    watchdog: Watchdog,
+    /// Time base for the watchdog.
+    epoch: Instant,
     rate: u32,
     channels: u16,
     hw: AudioHardwarePrefs,
@@ -36,13 +56,108 @@ enum Note {
 }
 
 impl Note {
+    /// Localized status text for a fallback device (name interpolated through `fmt`) or for no output device.
     fn text(&self) -> String {
         use filmcraft_ui_egui::i18n::{fmt, t};
         match self {
             Note::Fallback(device) => fmt(t("Audio hardware: the default output device cannot be opened; using '{device}'"), &[("device", device)]),
-            Note::NoDevice => t("No audio output device found: playing without sound (check Settings ▸ Audio Hardware)").to_string(),
+            Note::NoDevice => t("No audio output device found: playing without sound (check Settings > Audio Hardware)").to_string(),
         }
     }
+}
+
+/// Whether the settings name a sample rate the device does not already run at, so its supported
+/// configurations have to be listed. `0` is the settings' "device default".
+fn needs_rate_search(default_rate: u32, want: u32) -> bool {
+    want != 0 && want != default_rate
+}
+
+/// The stream configuration the settings ask for, falling back to the device default.
+///
+/// Listing a device's configurations means probing every format and rate in the driver:
+/// 150-215 ms on WASAPI (measured), while opening the stream itself costs ~20 ms warm (0.5-1 s
+/// from a cold audio engine). So the list is only asked for when the settings name a rate the
+/// device does not already run at (#2633).
+fn stream_config(hw: &AudioHardwarePrefs, document_rate: Option<u32>, dev: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+    let default = dev.default_output_config().map_err(|e| e.to_string())?;
+    let want = if hw.force_document_rate { document_rate.unwrap_or(hw.sample_rate) } else { hw.sample_rate };
+    if !needs_rate_search(default.sample_rate().0, want) {
+        return Ok(default);
+    }
+    let exact = dev.supported_output_configs().ok().and_then(|it| {
+        it.filter(|c| c.channels() > 0 && (c.min_sample_rate().0..=c.max_sample_rate().0).contains(&want))
+            .max_by_key(|c| (c.channels() == default.channels(), c.sample_format() == cpal::SampleFormat::F32, c.sample_format() == default.sample_format()))
+            .and_then(|c| c.try_with_sample_rate(cpal::SampleRate(want)))
+    });
+    Ok(exact.unwrap_or(default))
+}
+
+/// Build the output stream for `config`'s sample format, rendering `fill` into it.
+fn stream_for(
+    dev: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    fill: Arc<Mutex<Fill>>,
+    played: Arc<AtomicU64>,
+    health: Arc<Health>,
+) -> Result<cpal::Stream, String> {
+    let channels = usize::from(config.channels);
+    let stream = match format {
+        cpal::SampleFormat::F32 => {
+            let error_health = health.clone();
+            dev.build_output_stream(
+                config,
+                move |buf: &mut [f32], _| render(&fill, buf, channels, &played, &health),
+                move |e| stream_error(&error_health, e),
+                None,
+            )
+        }
+        cpal::SampleFormat::I8 => converted_stream::<i8>(dev, config, fill, played, health),
+        cpal::SampleFormat::I16 => converted_stream::<i16>(dev, config, fill, played, health),
+        cpal::SampleFormat::I24 => converted_stream::<cpal::I24>(dev, config, fill, played, health),
+        cpal::SampleFormat::I32 => converted_stream::<i32>(dev, config, fill, played, health),
+        cpal::SampleFormat::I64 => converted_stream::<i64>(dev, config, fill, played, health),
+        cpal::SampleFormat::U8 => converted_stream::<u8>(dev, config, fill, played, health),
+        cpal::SampleFormat::U16 => converted_stream::<u16>(dev, config, fill, played, health),
+        cpal::SampleFormat::U32 => converted_stream::<u32>(dev, config, fill, played, health),
+        cpal::SampleFormat::U64 => converted_stream::<u64>(dev, config, fill, played, health),
+        cpal::SampleFormat::F64 => converted_stream::<f64>(dev, config, fill, played, health),
+        other => return Err(format!("unsupported sample format {other:?}")),
+    };
+    stream.map_err(|e| e.to_string())
+}
+
+fn converted_stream<T>(
+    dev: &cpal::Device,
+    config: &cpal::StreamConfig,
+    fill: Arc<Mutex<Fill>>,
+    played: Arc<AtomicU64>,
+    health: Arc<Health>,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let channels = usize::from(config.channels);
+    let error_health = health.clone();
+    let mut scratch = Vec::new();
+    dev.build_output_stream(
+        config,
+        move |buf: &mut [T], _| {
+            // Reuse the conversion buffer. A pathological driver buffer must not panic the audio thread.
+            if buf.len() > 1_048_576 || scratch.try_reserve(buf.len().saturating_sub(scratch.len())).is_err() {
+                buf.fill(T::EQUILIBRIUM);
+                if !health.failed.swap(true, Ordering::SeqCst) {
+                    eprintln!("filmcraft: unable to allocate the audio conversion buffer");
+                }
+                return;
+            }
+            scratch.resize(buf.len(), 0.0);
+            render(&fill, &mut scratch, channels, &played, &health);
+            convert_samples(&scratch, buf);
+        },
+        move |e| stream_error(&error_health, e),
+        None,
+    )
 }
 
 /// The host named in the settings (empty or unknown = the default host).
@@ -128,8 +243,11 @@ impl CpalOut {
         };
         Self {
             stream: None,
+            fill: None,
             played: Arc::new(AtomicU64::new(0)),
-            failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(Health::default()),
+            watchdog: Watchdog::default(),
+            epoch: Instant::now(),
             rate: cfg.as_ref().map_or(48_000, |c| c.sample_rate().0),
             channels: cfg.as_ref().map_or(2, |c| c.channels()),
             hw: AudioHardwarePrefs::default(),
@@ -139,58 +257,156 @@ impl CpalOut {
         }
     }
 
-    /// The stream configuration the settings ask for, falling back to the device default.
+    /// The stream configuration the settings ask for (see [`stream_config`]).
     fn config(&self, dev: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
-        let default = dev.default_output_config().map_err(|e| e.to_string())?;
-        let want = if self.hw.force_document_rate { self.document_rate.unwrap_or(self.hw.sample_rate) } else { self.hw.sample_rate };
-        let exact = dev.supported_output_configs().ok().and_then(|it| {
-            it.filter(|c| c.channels() > 0 && (c.min_sample_rate().0..=c.max_sample_rate().0).contains(&want))
-                .max_by_key(|c| {
-                    (c.channels() == default.channels(), c.sample_format() == cpal::SampleFormat::F32, c.sample_format() == default.sample_format())
-                })
-                .and_then(|c| c.try_with_sample_rate(cpal::SampleRate(want)))
-        });
-        Ok(exact.unwrap_or(default))
+        stream_config(&self.hw, self.document_rate, dev)
     }
 
-    fn converted_stream<T>(
-        &self,
-        dev: &cpal::Device,
-        config: &cpal::StreamConfig,
-        mut fill: Box<dyn FnMut(&mut [f32], usize) + Send>,
-    ) -> Result<cpal::Stream, cpal::BuildStreamError>
-    where
-        T: cpal::SizedSample + cpal::FromSample<f32>,
-    {
-        let channels = usize::from(config.channels);
-        let played = self.played.clone();
-        let failed = self.failed.clone();
-        let error_flag = failed.clone();
-        let mut scratch = Vec::new();
-        dev.build_output_stream(
-            config,
-            move |buf: &mut [T], _| {
-                // Reuse the conversion buffer. A pathological driver buffer must not panic the audio thread.
-                if buf.len() > 1_048_576 || scratch.try_reserve(buf.len().saturating_sub(scratch.len())).is_err() {
-                    buf.fill(T::EQUILIBRIUM);
-                    if !failed.swap(true, Ordering::SeqCst) {
-                        eprintln!("filmcraft: unable to allocate the audio conversion buffer");
-                    }
-                    return;
-                }
-                scratch.resize(buf.len(), 0.0);
-                fill(&mut scratch, channels);
-                convert_samples(&scratch, buf);
-                played.fetch_add((buf.len() / channels) as u64, Ordering::SeqCst);
-            },
-            move |e| stream_error(&error_flag, e),
-            None,
-        )
+    /// Open the configured output device and play `fill` on it. `expect` is the (sample rate,
+    /// channels) a restarted stream must keep: the mixer was set up for them.
+    fn open(&mut self, fill: Arc<Mutex<Fill>>, expect: Option<(u32, u16)>) -> Result<(), String> {
+        let host = host(&self.hw.device_class);
+        let DeviceChoice { device: dev, fallback } = output_device(&host, &self.hw.default_output, &self.fallback).ok_or("no output device")?;
+        self.note = fallback;
+        let cfg = self.config(&dev)?;
+        let channels = cfg.channels() as usize;
+        if channels == 0 || cfg.sample_rate().0 == 0 {
+            return Err("the output device returned an invalid channel count or sample rate".into());
+        }
+        if let Some((rate, ch)) = expect
+            && (rate, ch) != (cfg.sample_rate().0, cfg.channels())
+        {
+            return Err(format!("the output device now runs at {} Hz with {} channels", cfg.sample_rate().0, cfg.channels()));
+        }
+        let mut config: cpal::StreamConfig = cfg.clone().into();
+        if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size()
+            && (*min..=*max).contains(&self.hw.buffer_size)
+        {
+            config.buffer_size = cpal::BufferSize::Fixed(self.hw.buffer_size);
+        }
+        self.rate = cfg.sample_rate().0;
+        self.channels = cfg.channels();
+        let stream = stream_for(&dev, &config, cfg.sample_format(), fill, self.played.clone(), self.health.clone())?;
+        stream.play().map_err(|e| e.to_string())?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    /// Replace a dropped stream with a new one on the same mixer, clock and format.
+    fn restart(&mut self) -> Result<(), String> {
+        let fill = self.fill.clone().ok_or("nothing is playing")?;
+        let expect = (self.rate, self.channels);
+        // The old stream (and its audio thread) goes first: only one stream ever runs the mixer.
+        self.stream = None;
+        self.health.clear_errors();
+        self.open(fill, Some(expect))
     }
 }
 
-fn stream_error(failed: &AtomicBool, e: cpal::StreamError) {
-    if !failed.swap(true, Ordering::SeqCst) {
+/// What the audio thread reports to the UI thread.
+#[derive(Default)]
+struct Health {
+    /// The device went away (unplugged): restart the stream at once.
+    lost: AtomicBool,
+    /// A backend error since the last check (cpal keeps the stream alive after these): restart
+    /// only if the stream also stopped consuming samples.
+    errored: AtomicBool,
+    /// Unrecoverable: the mixer panicked, a buffer could not be allocated, or restarts ran out.
+    /// [`AudioOut::played_frames`] reports `None` and playback goes on without sound.
+    failed: AtomicBool,
+    /// The first error of a stream has been printed.
+    reported: AtomicBool,
+}
+
+impl Health {
+    fn clear_errors(&self) {
+        self.lost.store(false, Ordering::SeqCst);
+        self.errored.store(false, Ordering::SeqCst);
+        self.reported.store(false, Ordering::SeqCst);
+    }
+}
+
+/// How long a stream that reported an error may go without consuming samples before it is
+/// restarted. Well under the UI's `AUDIO_STALL_S`, which gives up on the device clock.
+const STALL_RESTART: Duration = Duration::from_millis(300);
+/// At most this many restarts within [`RESTART_WINDOW`]; a device that keeps failing gives up.
+const MAX_RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(10);
+
+/// What [`Watchdog::check`] decides about the running stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    Healthy,
+    Restart,
+    GiveUp,
+}
+
+/// Decides when a stream that reported errors is restarted (UI thread, every frame).
+#[derive(Default)]
+struct Watchdog {
+    /// Played-frame count last seen, and when it last changed.
+    seen: (u64, Duration),
+    /// An error was reported and the stream has not consumed samples since.
+    pending_error: bool,
+    /// When recent restarts happened (at most [`MAX_RESTARTS`] kept).
+    restarts: Vec<Duration>,
+}
+
+impl Watchdog {
+    fn reset(&mut self, now: Duration) {
+        *self = Self { seen: (0, now), ..Self::default() };
+    }
+
+    fn check(&mut self, now: Duration, played: u64, errored: bool, lost: bool) -> Verdict {
+        if played != self.seen.0 {
+            self.seen = (played, now);
+            self.pending_error = false;
+        }
+        // An error that arrives with the stream still consuming samples is only a hiccup.
+        self.pending_error |= errored;
+        let stalled = now.saturating_sub(self.seen.1) >= STALL_RESTART;
+        if !(lost || (self.pending_error && stalled)) {
+            return Verdict::Healthy;
+        }
+        self.restarts.retain(|t| now.saturating_sub(*t) < RESTART_WINDOW);
+        if self.restarts.len() >= MAX_RESTARTS {
+            return Verdict::GiveUp;
+        }
+        self.restarts.push(now);
+        self.seen = (played, now);
+        self.pending_error = false;
+        Verdict::Restart
+    }
+}
+
+/// One device callback: run the shared mixer into `buf` and advance the clock. Never panics: a
+/// panicking mixer plays silence and fails the stream, and a mixer held by another stream (never
+/// expected: a restart drops the old stream first) plays silence without advancing the clock.
+fn render(fill: &Mutex<Fill>, buf: &mut [f32], channels: usize, played: &AtomicU64, health: &Health) {
+    let mut guard = match fill.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            buf.fill(0.0);
+            return;
+        }
+    };
+    if health.failed.load(Ordering::SeqCst) || catch_unwind(AssertUnwindSafe(|| (*guard)(buf, channels))).is_err() {
+        buf.fill(0.0);
+        if !health.failed.swap(true, Ordering::SeqCst) {
+            eprintln!("filmcraft: the audio mixer failed; playing without sound");
+        }
+        return;
+    }
+    played.fetch_add((buf.len() / channels.max(1)) as u64, Ordering::SeqCst);
+}
+
+fn stream_error(health: &Health, e: cpal::StreamError) {
+    match e {
+        cpal::StreamError::DeviceNotAvailable => health.lost.store(true, Ordering::SeqCst),
+        cpal::StreamError::BackendSpecific { .. } => health.errored.store(true, Ordering::SeqCst),
+    }
+    if !health.reported.swap(true, Ordering::SeqCst) {
         eprintln!("filmcraft: audio stream error: {e}");
     }
 }
@@ -204,57 +420,41 @@ fn convert_samples<T: cpal::Sample + cpal::FromSample<f32>>(input: &[f32], outpu
 }
 
 impl AudioOut for CpalOut {
-    fn start(&mut self, mut fill: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
+    fn start(&mut self, fill: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
         self.stop();
-        let host = host(&self.hw.device_class);
-        let DeviceChoice { device: dev, fallback } = output_device(&host, &self.hw.default_output, &self.fallback).ok_or("no output device")?;
-        self.note = fallback;
-        let cfg = self.config(&dev)?;
-        let channels = cfg.channels() as usize;
-        if channels == 0 || cfg.sample_rate().0 == 0 {
-            return Err("the output device returned an invalid channel count or sample rate".into());
-        }
-        let mut config: cpal::StreamConfig = cfg.clone().into();
-        if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size()
-            && (*min..=*max).contains(&self.hw.buffer_size)
-        {
-            config.buffer_size = cpal::BufferSize::Fixed(self.hw.buffer_size);
-        }
-        self.rate = cfg.sample_rate().0;
-        self.channels = cfg.channels();
         self.played.store(0, Ordering::SeqCst);
-        self.failed.store(false, Ordering::SeqCst);
-        let played = self.played.clone();
-        let failed = self.failed.clone();
-        let stream = match cfg.sample_format() {
-            cpal::SampleFormat::F32 => dev.build_output_stream(
-                &config,
-                move |buf: &mut [f32], _| {
-                    fill(buf, channels);
-                    played.fetch_add((buf.len() / channels) as u64, Ordering::SeqCst);
-                },
-                move |e| stream_error(&failed, e),
-                None,
-            ),
-            cpal::SampleFormat::I8 => self.converted_stream::<i8>(&dev, &config, fill),
-            cpal::SampleFormat::I16 => self.converted_stream::<i16>(&dev, &config, fill),
-            cpal::SampleFormat::I24 => self.converted_stream::<cpal::I24>(&dev, &config, fill),
-            cpal::SampleFormat::I32 => self.converted_stream::<i32>(&dev, &config, fill),
-            cpal::SampleFormat::I64 => self.converted_stream::<i64>(&dev, &config, fill),
-            cpal::SampleFormat::U8 => self.converted_stream::<u8>(&dev, &config, fill),
-            cpal::SampleFormat::U16 => self.converted_stream::<u16>(&dev, &config, fill),
-            cpal::SampleFormat::U32 => self.converted_stream::<u32>(&dev, &config, fill),
-            cpal::SampleFormat::U64 => self.converted_stream::<u64>(&dev, &config, fill),
-            cpal::SampleFormat::F64 => self.converted_stream::<f64>(&dev, &config, fill),
-            other => return Err(format!("unsupported sample format {other:?}")),
-        }
-        .map_err(|e| e.to_string())?;
-        stream.play().map_err(|e| e.to_string())?;
-        self.stream = Some(stream);
+        self.health = Arc::new(Health::default());
+        self.watchdog.reset(self.epoch.elapsed());
+        let fill = Arc::new(Mutex::new(fill));
+        self.open(fill.clone(), None)?;
+        self.fill = Some(fill);
         Ok(self.rate)
     }
     fn stop(&mut self) {
         self.stream = None;
+        self.fill = None;
+    }
+    fn recover(&mut self) {
+        if self.stream.is_none() || self.health.failed.load(Ordering::SeqCst) {
+            return;
+        }
+        let lost = self.health.lost.swap(false, Ordering::SeqCst);
+        let errored = self.health.errored.swap(false, Ordering::SeqCst);
+        match self.watchdog.check(self.epoch.elapsed(), self.played.load(Ordering::SeqCst), errored, lost) {
+            Verdict::Healthy => {}
+            Verdict::Restart => {
+                log::warn!("the audio output stream {}; restarting it", if lost { "lost its device" } else { "stopped after an error" });
+                if let Err(e) = self.restart() {
+                    log::warn!("the audio output stream could not be restarted: {e}");
+                    self.stream = None;
+                    self.health.failed.store(true, Ordering::SeqCst);
+                }
+            }
+            Verdict::GiveUp => {
+                log::warn!("the audio output stream keeps failing ({MAX_RESTARTS} restarts within {} s)", RESTART_WINDOW.as_secs());
+                self.health.failed.store(true, Ordering::SeqCst);
+            }
+        }
     }
     fn sample_rate(&self) -> u32 {
         self.rate
@@ -263,7 +463,7 @@ impl AudioOut for CpalOut {
         self.channels as usize
     }
     fn played_frames(&self) -> Option<u64> {
-        self.stream.as_ref().filter(|_| !self.failed.load(Ordering::SeqCst)).map(|_| self.played.load(Ordering::SeqCst))
+        self.stream.as_ref().filter(|_| !self.health.failed.load(Ordering::SeqCst)).map(|_| self.played.load(Ordering::SeqCst))
     }
     fn devices(&self) -> AudioDevices {
         let h = host(&self.hw.device_class);
@@ -291,6 +491,169 @@ impl AudioOut for CpalOut {
     }
 }
 
+/// How long the scrub stream stays open after the last grain. A run of scrubs — the usual way of
+/// scrubbing — then never pays the open again, and the device goes back to the desktop when the
+/// user stops.
+const SCRUB_KEEP: Duration = Duration::from_secs(5);
+
+/// How long [`ScrubOut::release`] waits for the scrub thread to close its stream. Dropping an open
+/// stream takes a few milliseconds (2.5-22 ms measured on WASAPI); a stream that is still opening
+/// is not waited for longer than this, and playback goes ahead.
+const RELEASE_WAIT: Duration = Duration::from_millis(250);
+
+/// The scrub grain's output, on its own thread (#2633).
+///
+/// Opening a WASAPI output stream starts the Windows audio engine: 0.5-1 s measured on Realtek,
+/// against ~20 ms when another stream is already running. On the UI thread that froze the playhead
+/// at the start of every click and drag. `cpal::Stream` is `!Send`, so the thread that opens it
+/// keeps owning it; the UI only posts the grain's mixer and returns, and a drag never waits for
+/// the device.
+pub struct CpalScrubOut {
+    tx: Sender<ScrubCmd>,
+    /// The rate the grain is mixed at, read off the device's configuration without opening it.
+    rate: u32,
+}
+
+enum ScrubCmd {
+    Play(Fill),
+    Stop,
+    /// Close the stream now and say so: playback opens its own next.
+    Release(Sender<()>),
+    Configure(AudioHardwarePrefs, Option<u32>),
+}
+
+impl CpalScrubOut {
+    pub fn new(hw: &AudioHardwarePrefs, document_rate: Option<u32>) -> Self {
+        Self::spawn(scrub_rate(hw, document_rate), hw.clone(), document_rate, open_scrub)
+    }
+
+    /// The output at mix rate `rate`, with `open` opening its stream on the scrub thread. The
+    /// tests pass one that never touches a device: cpal's WASAPI device enumerator lives in the
+    /// COM apartment of the thread that first used it, and a test's thread ends with its test.
+    fn spawn<S>(
+        rate: u32,
+        hw: AudioHardwarePrefs,
+        document_rate: Option<u32>,
+        open: impl FnMut(&AudioHardwarePrefs, Option<u32>, Fill) -> Result<(S, Arc<Mutex<Fill>>), String> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = channel();
+        if let Err(e) = std::thread::Builder::new().name("filmcraft-scrub".into()).spawn(move || run_scrub(rx, hw, document_rate, open)) {
+            log::warn!("the scrub audio thread could not start: {e}");
+        }
+        Self { tx, rate }
+    }
+
+    fn send(&self, cmd: ScrubCmd) {
+        if let Err(e) = self.tx.send(cmd) {
+            log::warn!("the scrub audio thread is gone: {e}");
+        }
+    }
+}
+
+impl ScrubOut for CpalScrubOut {
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn play(&mut self, fill: Fill) {
+        self.send(ScrubCmd::Play(fill));
+    }
+    fn stop(&mut self) {
+        self.send(ScrubCmd::Stop);
+    }
+    fn release(&mut self) {
+        let (ack, done) = channel();
+        self.send(ScrubCmd::Release(ack));
+        if done.recv_timeout(RELEASE_WAIT).is_err() {
+            log::warn!("the scrub audio stream did not close within {RELEASE_WAIT:?}; starting playback anyway");
+        }
+    }
+    fn configure(&mut self, hw: &AudioHardwarePrefs, document_rate: Option<u32>) {
+        self.rate = scrub_rate(hw, document_rate);
+        self.send(ScrubCmd::Configure(hw.clone(), document_rate));
+    }
+}
+
+/// The scrub thread: owns the stream (cpal's `Stream` is `!Send`) and closes it once nothing has
+/// played for [`SCRUB_KEEP`].
+fn run_scrub<S>(
+    rx: Receiver<ScrubCmd>,
+    mut hw: AudioHardwarePrefs,
+    mut document_rate: Option<u32>,
+    mut open: impl FnMut(&AudioHardwarePrefs, Option<u32>, Fill) -> Result<(S, Arc<Mutex<Fill>>), String>,
+) {
+    let mut stream: Option<S> = None;
+    // the mixer the open stream's callback runs: a new grain swaps in the current one
+    let mut slot: Option<Arc<Mutex<Fill>>> = None;
+    loop {
+        let cmd = if stream.is_some() {
+            match rx.recv_timeout(SCRUB_KEEP) {
+                Ok(cmd) => cmd,
+                Err(RecvTimeoutError::Timeout) => {
+                    stream = None;
+                    slot = None;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            }
+        };
+        match cmd {
+            ScrubCmd::Play(fill) => match slot.as_ref() {
+                // the stream is still warm: play this grain's mixer on it
+                Some(slot) => *slot.lock().unwrap_or_else(PoisonError::into_inner) = fill,
+                None => match open(&hw, document_rate, fill) {
+                    Ok((s, f)) => {
+                        stream = Some(s);
+                        slot = Some(f);
+                    }
+                    Err(e) => log::warn!("audio output unavailable for scrubbing: {e}"),
+                },
+            },
+            // the grain and the UI's linger are over; the idle timeout above closes the stream
+            ScrubCmd::Stop => {}
+            ScrubCmd::Release(ack) => {
+                stream = None;
+                slot = None;
+                let _ = ack.send(());
+            }
+            ScrubCmd::Configure(new_hw, new_rate) => {
+                hw = new_hw;
+                document_rate = new_rate;
+                stream = None;
+                slot = None;
+            }
+        }
+    }
+}
+
+/// The rate the scrub grain is mixed at: the device's configuration, without opening a stream.
+fn scrub_rate(hw: &AudioHardwarePrefs, document_rate: Option<u32>) -> u32 {
+    let host = host(&hw.device_class);
+    output_device(&host, &hw.default_output, &Mutex::new(None))
+        .and_then(|c| stream_config(hw, document_rate, &c.device).ok())
+        .map_or(48_000, |c| c.sample_rate().0)
+}
+
+fn open_scrub(hw: &AudioHardwarePrefs, document_rate: Option<u32>, fill: Fill) -> Result<(cpal::Stream, Arc<Mutex<Fill>>), String> {
+    let host = host(&hw.device_class);
+    let dev = output_device(&host, &hw.default_output, &Mutex::new(None)).ok_or("no output device")?.device;
+    let cfg = stream_config(hw, document_rate, &dev)?;
+    let mut config: cpal::StreamConfig = cfg.clone().into();
+    if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size()
+        && (*min..=*max).contains(&hw.buffer_size)
+    {
+        config.buffer_size = cpal::BufferSize::Fixed(hw.buffer_size);
+    }
+    let fill = Arc::new(Mutex::new(fill));
+    let stream = stream_for(&dev, &config, cfg.sample_format(), fill.clone(), Arc::new(AtomicU64::new(0)), Arc::new(Health::default()))?;
+    stream.play().map_err(|e| e.to_string())?;
+    Ok((stream, fill))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +670,15 @@ mod tests {
     fn notes_name_the_fallback_device() {
         assert!(Note::Fallback("pipewire".into()).text().contains("'pipewire'"));
         assert!(!Note::NoDevice.text().is_empty());
+    }
+
+    /// #2633: the rate search costs ~190 ms on WASAPI, so the device default is taken as is.
+    #[test]
+    fn the_device_default_rate_is_used_without_listing_every_configuration() {
+        assert!(!needs_rate_search(48_000, 48_000), "the settings ask for the rate the device runs at");
+        assert!(!needs_rate_search(44_100, 0), "0 is the device default");
+        assert!(needs_rate_search(48_000, 44_100), "another rate has to be searched for");
+        assert!(needs_rate_search(48_000, 96_000));
     }
 
     #[test]
@@ -327,11 +699,161 @@ mod tests {
     }
 
     #[test]
-    fn failed_stream_relinquishes_the_playback_clock() {
-        let failed = AtomicBool::new(false);
-        stream_error(&failed, cpal::StreamError::DeviceNotAvailable);
-        assert!(failed.load(Ordering::SeqCst));
+    fn stream_errors_ask_for_a_restart_instead_of_failing_playback() {
+        let health = Health::default();
+        stream_error(&health, cpal::StreamError::BackendSpecific { err: cpal::BackendSpecificError { description: "`alsa::poll()` returned POLLERR".into() } });
+        assert!(health.errored.load(Ordering::SeqCst) && !health.lost.load(Ordering::SeqCst));
+        stream_error(&health, cpal::StreamError::DeviceNotAvailable);
+        assert!(health.lost.load(Ordering::SeqCst));
+        assert!(!health.failed.load(Ordering::SeqCst), "a stream error alone must not silence playback");
         let output = CpalOut::new();
-        assert_eq!(output.played_frames(), None);
+        assert_eq!(output.played_frames(), None, "no stream, no clock");
+    }
+
+    /// A stand-in for a device stream that reports when it is dropped. The scrub tests never touch
+    /// a real device: cpal's WASAPI device enumerator lives in the COM apartment of the thread that
+    /// first used it, and libtest's per-test threads end with their test, so the next test to use
+    /// it on Windows read freed memory (STATUS_ACCESS_VIOLATION).
+    struct FakeStream(Sender<&'static str>);
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            let _ = self.0.send("closed");
+        }
+    }
+
+    /// A scrub output whose stream takes `open_ms` to open (a cold WASAPI engine took ~0.6 s), and
+    /// the events it reports: "opened" and "closed".
+    fn fake_scrub_output(open_ms: u64) -> (CpalScrubOut, Receiver<&'static str>) {
+        let (log, events) = channel();
+        let open = move |_: &AudioHardwarePrefs, _: Option<u32>, fill: Fill| {
+            std::thread::sleep(ms(open_ms));
+            let _ = log.send("opened");
+            Ok((FakeStream(log.clone()), Arc::new(Mutex::new(fill))))
+        };
+        (CpalScrubOut::spawn(48_000, AudioHardwarePrefs::default(), None, open), events)
+    }
+
+    fn silence() -> Fill {
+        Box::new(|buf: &mut [f32], _| buf.fill(0.0))
+    }
+
+    /// #2633: the frame that moves the playhead asks for the scrub output, so the ask must not
+    /// wait for the device, however long the open takes on the scrub thread. A grain on the open
+    /// stream opens nothing more.
+    #[test]
+    fn asking_for_the_scrub_output_hands_the_open_to_its_thread() {
+        let (mut out, events) = fake_scrub_output(600);
+        assert_eq!(out.sample_rate(), 48_000, "the mix rate is known before the stream opens");
+        let t = Instant::now();
+        out.play(silence());
+        let took = t.elapsed();
+        assert!(took < ms(100), "play waited {took:?} for the device");
+        assert_eq!(events.recv_timeout(ms(5_000)), Ok("opened"), "the scrub thread opened it");
+        out.play(silence());
+        out.release();
+        assert_eq!(events.recv_timeout(ms(5_000)), Ok("closed"), "the second grain reused the stream");
+    }
+
+    /// Playback gives the scrub device back first: `release` returns once an open stream is
+    /// closed, at once when none is open, and after at most [`RELEASE_WAIT`] while one is still
+    /// opening; that one closes as soon as its open finishes.
+    #[test]
+    fn releasing_the_scrub_output_closes_it_and_never_waits_long() {
+        let (mut out, events) = fake_scrub_output(0);
+        let t = Instant::now();
+        out.release();
+        assert!(t.elapsed() < ms(100), "nothing open, yet release waited {:?}", t.elapsed());
+        out.play(silence());
+        assert_eq!(events.recv_timeout(ms(5_000)), Ok("opened"));
+        out.release();
+        assert_eq!(events.try_recv(), Ok("closed"), "the stream closed before release returned");
+
+        let (mut slow, slow_events) = fake_scrub_output(1_000);
+        slow.play(silence());
+        let t = Instant::now();
+        slow.release();
+        let took = t.elapsed();
+        assert!(took >= RELEASE_WAIT && took < RELEASE_WAIT + ms(500), "release waited {took:?} for a stream still opening");
+        assert_eq!(slow_events.recv_timeout(ms(5_000)), Ok("opened"));
+        assert_eq!(slow_events.recv_timeout(ms(5_000)), Ok("closed"), "the release closes it once it is open");
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn an_error_while_samples_keep_flowing_is_only_a_hiccup() {
+        let mut w = Watchdog::default();
+        w.reset(ms(0));
+        assert_eq!(w.check(ms(10), 480, true, false), Verdict::Healthy);
+        // the stream keeps consuming samples after the error: never restarted
+        for (i, t) in (20..2_000).step_by(20).enumerate() {
+            assert_eq!(w.check(ms(t), 480 * (i as u64 + 2), false, false), Verdict::Healthy);
+        }
+    }
+
+    #[test]
+    fn a_stream_that_errors_and_stops_consuming_is_restarted() {
+        let mut w = Watchdog::default();
+        w.reset(ms(0));
+        assert_eq!(w.check(ms(10), 480, false, false), Verdict::Healthy);
+        // POLLERR: the backend reports errors and no longer calls back
+        assert_eq!(w.check(ms(20), 480, true, false), Verdict::Healthy);
+        assert_eq!(w.check(ms(200), 480, true, false), Verdict::Healthy);
+        assert_eq!(w.check(ms(310), 480, false, false), Verdict::Restart);
+        // the restarted stream gets a fresh grace period
+        assert_eq!(w.check(ms(400), 480, false, false), Verdict::Healthy);
+        // a stall without any reported error is left to the UI's own watchdog
+        assert_eq!(w.check(ms(2_000), 480, false, false), Verdict::Healthy);
+    }
+
+    #[test]
+    fn a_lost_device_restarts_at_once_and_repeated_failures_give_up() {
+        let mut w = Watchdog::default();
+        w.reset(ms(0));
+        assert_eq!(w.check(ms(5), 0, false, true), Verdict::Restart);
+        assert_eq!(w.check(ms(10), 0, false, true), Verdict::Restart);
+        assert_eq!(w.check(ms(15), 0, false, true), Verdict::Restart);
+        assert_eq!(w.check(ms(20), 0, false, true), Verdict::GiveUp);
+        // sporadic failures far apart keep being recovered
+        assert_eq!(w.check(ms(10_006), 0, false, true), Verdict::Restart);
+    }
+
+    #[test]
+    fn the_device_callback_never_panics_and_counts_played_frames() {
+        let (played, health) = (AtomicU64::new(0), Health::default());
+        let fill: Mutex<Fill> = Mutex::new(Box::new(|buf: &mut [f32], _| buf.fill(0.25)));
+        let mut buf = [1.0_f32; 8];
+        render(&fill, &mut buf, 2, &played, &health);
+        assert_eq!((buf, played.load(Ordering::SeqCst)), ([0.25; 8], 4));
+        // a mixer still held elsewhere plays silence without moving the clock
+        {
+            let _held = fill.lock().unwrap();
+            render(&fill, &mut buf, 2, &played, &health);
+        }
+        assert_eq!((buf, played.load(Ordering::SeqCst)), ([0.0; 8], 4));
+        // zero channels from a broken driver must not divide by zero
+        render(&fill, &mut buf, 0, &played, &health);
+        assert_eq!(played.load(Ordering::SeqCst), 12);
+    }
+
+    #[test]
+    fn a_panicking_mixer_plays_silence_and_fails_the_stream() {
+        let (played, health) = (AtomicU64::new(0), Health::default());
+        let fill: Mutex<Fill> = Mutex::new(Box::new(|buf: &mut [f32], _| {
+            buf.fill(0.5);
+            panic!("mixer bug");
+        }));
+        let mut buf = [1.0_f32; 4];
+        render(&fill, &mut buf, 2, &played, &health);
+        assert_eq!(buf, [0.0; 4]);
+        assert_eq!(played.load(Ordering::SeqCst), 0);
+        assert!(health.failed.load(Ordering::SeqCst));
+        // later callbacks stay silent instead of re-entering the broken mixer
+        buf = [1.0; 4];
+        render(&fill, &mut buf, 2, &played, &health);
+        assert_eq!(buf, [0.0; 4]);
     }
 }

@@ -6,7 +6,7 @@ name: Windows test build (Blackmagic RAW)
 
 on:
   push:
-    branches: [braw-support]
+    branches: [braw-support, braw-support-latest]
   workflow_dispatch:
 
 permissions:

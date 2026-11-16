@@ -159,11 +159,13 @@ fn plugins_render_through_filmcraft_effects() {
     let cx = filmcraft_render::effects::FxCtx {
         t: Tick::ZERO,
         px_scale: 1.0,
+        mask_scale: 1.0,
         seconds: 0.0,
         timecode: "00:00:00:00",
         clip_name: "test",
         project: None,
         env: None,
+        frame_rate: 24.0,
         working: Default::default(),
     };
     // Gain on red only: red halves on the display curve, the rest is untouched
