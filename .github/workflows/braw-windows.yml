@@ -27,6 +27,8 @@ jobs:
     name: Windows x64
     runs-on: windows-latest
     timeout-minutes: 120
+    permissions:
+      contents: write # publishes the "latest-build" release (the fixed download link)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -148,3 +150,20 @@ jobs:
           path: dist/FilmCraft-BRAW-windows-x64
           if-no-files-found: error
           retention-days: 30
+
+      # One fixed download link for the newest build of braw-support-latest:
+      # https://github.com/<owner>/filmcraft/releases/download/latest-build/FilmCraft-BRAW-windows-x64.zip
+      # The release is replaced on every build, so its tag always names the commit that was built.
+      - name: Publish the latest build (fixed download link)
+        if: github.ref == 'refs/heads/braw-support-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = 'dist\FilmCraft-BRAW-windows-x64.zip'
+          Compress-Archive -Path 'dist\FilmCraft-BRAW-windows-x64' -DestinationPath $zip -Force
+          gh release delete latest-build --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes 2>$null
+          $short = $env:GITHUB_SHA.Substring(0, 8)
+          $notes = "Unsigned Windows x64 test build of the braw-support-latest branch (commit $short). Replaced by every new build. Unzip and run filmcraft.exe."
+          gh release create latest-build $zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title "Latest Windows test build ($short)" --notes $notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
